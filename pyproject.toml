@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "incremental-editing-engine"
+version = "0.1.0"
+description = "Adaptive Incremental Editing Engine for cost-efficient engineering agents"
+requires-python = ">=3.10"
+dependencies = [
+    "openai>=1.40.0",
+    "jsonschema>=4.20.0",
+    "pytest>=8.0.0",
+    "python-dotenv>=1.0.0",
+    "pydantic-settings>=2.5.0",
+    "minio>=7.2.0",
+    "rich>=13.7.0",
+    "fastapi>=0.110.0",
+    "uvicorn[standard]>=0.29.0",
+    "rank-bm25>=0.2.2",
+    "numpy>=1.26.0",
+    "semgrep>=1.176.0",
+    "tree-sitter>=0.26.0",
+    "tree-sitter-language-pack>=1.16.1",
+]
+
+[project.scripts]
+iee = "incremental_editing.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["incremental_editing*"]

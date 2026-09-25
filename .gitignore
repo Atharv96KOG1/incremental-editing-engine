@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+.env
+.venv/
+.aider-venv/
+minio_local_data/
+.pytest_cache/
+*.egg-info/
+iee_metadata/
+node_modules/
+dist/
+.DS_Store
