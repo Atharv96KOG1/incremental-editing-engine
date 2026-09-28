@@ -3,7 +3,12 @@
 blank-line-paragraph fallback for everything else. No LLM call anywhere.
 """
 
-from incremental_editing.analyzer.text_blocks import block_context_window, index_text_blocks, locate_text_block
+from incremental_editing.analyzer.text_blocks import (
+    block_context_window,
+    index_text_blocks,
+    locate_text_block,
+    locate_text_blocks,
+)
 
 MARKDOWN_SOURCE = (
     "# Project\n\n"
@@ -100,6 +105,30 @@ def test_index_text_blocks_splits_html_on_top_level_body_elements():
     assert [b.name for b in blocks] == ["header", "main", "footer"]
 
 
+def test_index_text_blocks_html_includes_script_and_style_as_their_own_blocks():
+    """Real bug this closes: tree-sitter's HTML grammar gives <script>
+    and <style> their own distinct node types ("script_element"/
+    "style_element"), never plain "element" -- filtering children on
+    "element" alone made every <script>/<style> tag invisible to this
+    locator entirely, not merged into a neighboring block, just never a
+    candidate at all. Any request touching inline JS/CSS (extremely
+    common in a real HTML file) fell straight through to the whole-
+    file-block refusal even though a perfectly splice-able block
+    existed the whole time."""
+    source = (
+        "<html>\n"
+        "<body>\n"
+        '  <button id="helloBtn">Click</button>\n'
+        "  <script>\n"
+        "    const helloBtn = document.getElementById('helloBtn');\n"
+        "  </script>\n"
+        "</body>\n"
+        "</html>\n"
+    )
+    blocks = index_text_blocks(source, "html")
+    assert "script" in [b.name for b in blocks]
+
+
 def test_index_text_blocks_html_block_names_use_id_or_class():
     blocks = index_text_blocks(HTML_SOURCE, "html")
     main = next(b for b in blocks if b.name == "main")
@@ -145,6 +174,36 @@ def test_locate_text_block_finds_the_named_html_element():
     block = locate_text_block(HTML_SOURCE, "add EXPOSE-style text to the footer", "html")
     assert block is not None
     assert block.name == "footer"
+
+
+def test_locate_text_blocks_returns_every_relevant_block_for_a_cross_block_rename():
+    """Real bug this closes: "change the helloBtn to btn" needs BOTH the
+    button's own id attribute AND the inline <script> referencing that
+    id touched to stay correct -- neither block alone is a complete,
+    correct change. locate_text_block's single-best design saw this as
+    a tie (both blocks equally match "helloBtn") and refused outright;
+    locate_text_blocks returns both instead of picking one."""
+    source = (
+        "<html>\n"
+        "<body>\n"
+        '  <button id="helloBtn">Click</button>\n'
+        "  <script>\n"
+        "    const helloBtn = document.getElementById('helloBtn');\n"
+        "  </script>\n"
+        "</body>\n"
+        "</html>\n"
+    )
+    blocks = locate_text_blocks(source, "change the helloBtn to btn", "html")
+    assert {b.name for b in blocks} == {"button#helloBtn", "script"}
+
+
+def test_locate_text_blocks_returns_empty_when_nothing_matches():
+    assert locate_text_blocks(MARKDOWN_SOURCE, "completely unconnected topic xyz123", "markdown") == []
+
+
+def test_locate_text_blocks_returns_a_single_block_when_only_one_is_relevant():
+    blocks = locate_text_blocks(MARKDOWN_SOURCE, "add retrieval types in the notes part", "markdown")
+    assert [b.name for b in blocks] == ["Notes"]
 
 
 def test_locate_text_block_returns_none_for_a_single_block_file():

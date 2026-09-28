@@ -31,18 +31,8 @@ from typing import Optional
 
 from ..config import get_settings
 
-# Jev is advertised at 70-500ms per call -- this is a generous safety cap
-# for a slow/cold-starting gateway, not a normal-case expectation (same
-# reasoning vector_retriever.py's own timeout applies to embeddings
-# calls): a live edit request is waiting on this, so a half-broken
-# endpoint must fail fast into the existing pipeline, not hang it.
 _TIMEOUT_SECONDS = 10.0
 
-# Every escalate kind structured_edit.py's own prompt can produce, plus
-# "structured_edit" for the ordinary REPLACE/INSERT/DELETE case (no
-# escalation at all) -- kept in the model's own words so this classifier
-# and the LLM's own escalate detection can never quietly drift into
-# disagreeing on what a kind means.
 _KIND_CRITERIA = {
     "structured_edit": "A targeted change to one or a few existing functions/classes -- adding, "
     "replacing, or removing something inside their own bodies. The default/most common case.",
@@ -56,13 +46,6 @@ _KIND_CRITERIA = {
     "question": "Asks about the code or requests information -- not an instruction to change anything.",
 }
 
-# Only these kinds are safe to dispatch on directly from this
-# classification alone: both _run_question and _run_whole_file_edit need
-# nothing beyond the request text and the file's current source, the
-# same two inputs Jev itself saw. The other kinds need extra structured
-# fields (a target language, a file list, old/new name pairs) a Choice
-# answer doesn't produce -- those still go through STRUCTURED_EDIT's own
-# escalate detection (or an existing mechanical fast path) unchanged.
 DISPATCHABLE_KINDS = {"question", "whole_file"}
 
 

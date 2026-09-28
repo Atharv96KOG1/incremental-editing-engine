@@ -62,7 +62,7 @@ from ..analyzer.locator import (
 )
 from ..analyzer.metadata_builder import delete_file_metadata, extract_symbol_metadata, write_file_metadata
 from ..analyzer.module_blocks import locate_module_level_block
-from ..analyzer.text_blocks import block_context_window, locate_text_block
+from ..analyzer.text_blocks import block_context_window, locate_text_block, locate_text_blocks
 from ..apply.edit_applier import ApplyError, apply_delta
 from ..benchmark.pricing import estimate_cost
 from ..context.context_builder import build_context
@@ -81,7 +81,7 @@ from ..strategies.binary_artifact import (
 from ..strategies.full_regeneration import generate_full_file, generate_full_file_edit
 from ..strategies.import_repair import generate_import_fix
 from ..strategies.module_block_edit import generate_module_block_replacement
-from ..strategies.text_block_edit import generate_block_replacement
+from ..strategies.text_block_edit import generate_block_replacement, generate_multi_block_replacement
 from ..strategies.qa import generate_answer
 from ..strategies.structured_edit import generate_delta, generate_repair
 from ..validation.syntax import SyntaxCheckError, check_python_imports, check_syntax
@@ -89,19 +89,8 @@ from ..validation.tests import copy_project_for_validation, run_tests
 from ..versioning.version_manager import VersionManager
 from . import pending_confirmations
 
-MAX_REPAIR_ATTEMPTS = 2  # PHOENIX section 18: "bounded repair budget, one or two targeted attempts"
+MAX_REPAIR_ATTEMPTS = 2
 
-# Real, structural marker for "this IS (or is inside) this engine's own
-# repository" -- derived from where this module actually lives on disk
-# (never a hardcoded path string), so it stays correct wherever this
-# project is installed or cloned. Real, repeated case this warns about:
-# a project directory pointed at (or nested inside) this same repo means
-# every single edit's test_target validation runs THIS engine's own,
-# unrelated test suite (or whatever else happens to live alongside it)
-# instead of a real project's own -- slow, and reports failures/
-# regressions that have nothing to do with the actual change (see
-# UNRELATED_TEST_COLLECTION_ERROR below, which catches one concrete
-# symptom of exactly this after the fact; this warns about the cause).
 _ENGINE_REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
@@ -113,6 +102,58 @@ def _project_dir_is_this_engine(project_dir: Path) -> bool:
         return True
     except ValueError:
         return False
+
+
+def _discover_relevant_test_target(project_dir: Path, file: str) -> Optional[str]:
+    """A real, already-existing test file that's actually about `file` --
+    never invented, only discovered via the same naming convention
+    virtually every test suite already uses: test_<name>.<ext> or
+    <name>_test.<ext>, either co-located with the source file or under a
+    sibling/ancestor `tests/` directory mirroring its own path. Returns
+    the narrowest real match found, or None when nothing like that
+    exists at all -- the caller decides what "nothing found" means."""
+    rel = Path(file)
+    stem = rel.stem
+    candidates = [
+        rel.parent / f"test_{rel.name}",
+        rel.parent / f"{stem}_test{rel.suffix}",
+        rel.parent / "tests" / f"test_{rel.name}",
+        rel.parent / "tests" / f"{stem}_test{rel.suffix}",
+        Path("tests") / rel.parent / f"test_{rel.name}",
+        Path("tests") / f"test_{rel.name}",
+    ]
+    for candidate in candidates:
+        if (project_dir / candidate).is_file():
+            return str(candidate)
+    return None
+
+
+def _effective_test_target(test_target: str, project_dir: Path, file: str) -> str:
+    """Real bug this closes: `test_target` left at its default (".") --
+    the whole project directory -- previously meant every edit's own
+    validation ran pytest against EVERYTHING under project_dir,
+    including entirely unrelated content (other subprojects, scratch
+    folders, this engine's own repo) that happens to sit alongside the
+    real target. Real, observed case: editing `cores/newchatbot.py`
+    with project_dir pointed at a large, cluttered directory made
+    validation pytest '.' the whole thing, timing out after 120s on
+    unrelated tests that were never going to pass or fail because of
+    this change either way.
+
+    An explicit, narrower test_target the caller already chose is never
+    touched here -- only the broad default gets a chance to narrow
+    itself, and only ever down to something real: a discovered test
+    file actually about this change (see _discover_relevant_test_target),
+    or failing that, this file's own containing directory -- narrower
+    than the whole project root, but never invented; "no tests
+    collected" there is a legitimate pass, not a guess."""
+    if test_target != ".":
+        return test_target
+    discovered = _discover_relevant_test_target(project_dir, file)
+    if discovered:
+        return discovered
+    parent = str(Path(file).parent)
+    return parent if parent != "." else test_target
 
 
 class _TestFailure(Exception):
@@ -134,7 +175,7 @@ def _classify_failure(e: Exception) -> str:
         msg = str(e)
         if "schema validation failed" in msg:
             return "SCHEMA_ERROR"
-        return "REFERENCE_ERROR"  # target/anchor not found, or ambiguous duplicate
+        return "REFERENCE_ERROR"
     return "UNKNOWN"
 
 
@@ -213,10 +254,6 @@ def _persist_run(storage, project_id, run_id, delta_dict, metadata, attempt=None
     storage.put_json(f"projects/{project_id}/benchmarks/{run_id}.json", metadata)
     if delta_dict is not None:
         suffix = f"-attempt{attempt}" if attempt is not None else ""
-        # The raw LLM response text used to be stored alongside this under
-        # patches/*.raw.json -- pure duplicate bytes of this exact dict
-        # (json.loads(raw_json) == delta_dict), no reader anywhere ever
-        # used it. Dropped: same information, half the storage.
         storage.put_json(f"projects/{project_id}/deltas/{run_id}{suffix}.json", delta_dict)
 
 
@@ -731,6 +768,171 @@ def _run_text_block_edit(
     return metadata
 
 
+def _run_multi_text_block_edit(
+    project_dir: Path,
+    file: str,
+    request: str,
+    test_target: str,
+    project_id: str,
+    base_version: str,
+    original_source: str,
+    blocks,
+    require_confirmation: bool,
+    on_step: Callable[[str, str], None],
+    on_preview: Callable[[dict], None],
+    storage,
+    vm: VersionManager,
+    target_file: Path,
+) -> dict:
+    """Same mechanism _run_text_block_edit already uses, extended to
+    SEVERAL blocks in one generation call instead of committing to a
+    single best guess. Real gap this closes: a rename spanning a markup
+    block and its own inline <script> (an id used both in a tag
+    attribute and the JS that references it) needs BOTH touched to stay
+    correct -- locate_text_block's single-best design saw this as a tie
+    and refused outright, even though analyzer.text_blocks.locate_text_
+    blocks found exactly which two blocks were relevant.
+
+    `blocks` is the list analyzer.text_blocks.locate_text_blocks already
+    resolved -- the caller is expected to have already checked it has
+    at least 2 entries (a single match belongs to _run_text_block_edit
+    instead, which costs one less thing for the model to have to repeat
+    verbatim)."""
+    run_id = f"run-{uuid.uuid4().hex[:8]}"
+    on_step("GENERATE", f"regenerating {len(blocks)} blocks ({', '.join(b.name for b in blocks)})...")
+
+    lines = original_source.splitlines()
+    block_contents = [(b.name, "\n".join(lines[b.start_line - 1 : b.end_line])) for b in blocks]
+    gen = generate_multi_block_replacement(file_path=file, blocks=block_contents, user_request=request)
+
+    missing = [name for name, content in gen["blocks"].items() if content is None]
+    if missing:
+        metadata = {
+            "run_id": run_id,
+            "project_id": project_id,
+            "base_version": base_version,
+            "user_request": request,
+            "strategy": "MULTI_TEXT_BLOCK_EDIT",
+            "blocks": [b.name for b in blocks],
+            "generation": {
+                "model": gen["model"],
+                "input_tokens": gen["input_tokens"],
+                "cached_tokens": gen.get("cached_tokens", 0),
+                "output_tokens": gen["output_tokens"],
+                "total_tokens": gen["total_tokens"],
+                "latency_ms": gen["latency_ms"],
+                "estimated_cost_usd": estimate_cost(
+                    gen["model"], gen["input_tokens"], gen["output_tokens"], gen.get("cached_tokens", 0)
+                ),
+            },
+            "validation": {},
+            "result": {"status": "failed", "failure_class": "GENERATION_INCOMPLETE", "retry_count": 0, "fallback_used": False},
+            "error": f"model's response never addressed block(s): {', '.join(missing)}",
+        }
+        storage.put_json(f"projects/{project_id}/benchmarks/{run_id}.json", metadata)
+        return metadata
+
+    new_lines = list(lines)
+    for b in sorted(blocks, key=lambda b: b.start_line, reverse=True):
+        replacement = gen["blocks"][b.name].split("\n")
+        new_lines[b.start_line - 1 : b.end_line] = replacement
+    new_source = "\n".join(new_lines) + ("\n" if original_source.endswith("\n") or not original_source else "")
+
+    metadata = {
+        "run_id": run_id,
+        "project_id": project_id,
+        "base_version": base_version,
+        "user_request": request,
+        "strategy": "MULTI_TEXT_BLOCK_EDIT",
+        "blocks": [b.name for b in blocks],
+        "generation": {
+            "model": gen["model"],
+            "input_tokens": gen["input_tokens"],
+            "cached_tokens": gen.get("cached_tokens", 0),
+            "output_tokens": gen["output_tokens"],
+            "total_tokens": gen["total_tokens"],
+            "latency_ms": gen["latency_ms"],
+            "estimated_cost_usd": estimate_cost(
+                gen["model"], gen["input_tokens"], gen["output_tokens"], gen.get("cached_tokens", 0)
+            ),
+        },
+        "validation": {},
+        "result": {"status": "pending", "retry_count": 0, "fallback_used": False},
+    }
+
+    on_step("SYNTAX", "checking the regenerated file still parses...")
+    try:
+        check_syntax(new_source, filename=file)
+    except SyntaxCheckError as e:
+        metadata["result"]["status"] = "failed"
+        metadata["result"]["failure_class"] = "SYNTAX_ERROR"
+        metadata["error"] = str(e)
+        metadata["validation"] = {"syntax_passed": False, "tests_passed": None}
+        storage.put_json(f"projects/{project_id}/benchmarks/{run_id}.json", metadata)
+        return metadata
+
+    metadata["diff"] = "".join(
+        difflib.unified_diff(
+            original_source.splitlines(keepends=True),
+            new_source.splitlines(keepends=True),
+            fromfile=f"a/{file}",
+            tofile=f"b/{file}",
+        )
+    )
+    on_preview({"operations": [], "diff": metadata["diff"], "file": file, "new_file_content": new_source})
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_project = Path(tmp) / "project"
+        copy_project_for_validation(project_dir, tmp_project)
+        (tmp_project / file).write_text(new_source)
+
+        on_step("TEST", f"running pytest ({test_target})...")
+        test_result = run_tests(test_target, cwd=str(tmp_project))
+
+    metadata["validation"] = {
+        "syntax_passed": True,
+        "tests_passed": test_result["tests_passed"],
+        "no_tests_collected": test_result["no_tests_collected"],
+        "test_summary": {k: test_result[k] for k in ("passed", "failed", "errors")},
+        "regression_detected": not test_result["tests_passed"],
+    }
+
+    if not test_result["tests_passed"]:
+        metadata["result"]["status"] = "failed"
+        metadata["result"]["failure_class"] = "TEST_TIMEOUT" if test_result.get("timed_out") else "TEST_FAILURE"
+        metadata["error"] = test_result["output_tail"]
+        storage.put_json(f"projects/{project_id}/benchmarks/{run_id}.json", metadata)
+        return metadata
+
+    if require_confirmation:
+        metadata["result"]["status"] = "awaiting_confirmation"
+        metadata["file"] = file
+        pending_confirmations.stash(
+            run_id,
+            "multi_text_block_edit",
+            project_dir=str(project_dir),
+            files={file: new_source},
+            request=request,
+            project_id=project_id,
+            metadata=metadata,
+        )
+        return metadata
+
+    on_step("COMMIT", "validation passed, writing new version...")
+    version_id = vm.create_version(
+        files={file: new_source},
+        change_request=request,
+        strategy="MULTI_TEXT_BLOCK_EDIT",
+        delta_id=f"block-{run_id}",
+        validation_status="passed",
+    )
+    metadata["result"]["status"] = "success"
+    metadata["new_version"] = version_id
+    storage.put_json(f"projects/{project_id}/benchmarks/{run_id}.json", metadata)
+    target_file.write_text(new_source)
+    return metadata
+
+
 def _run_rename_identifier(
     project_dir: Path,
     file: str,
@@ -856,32 +1058,9 @@ def _run_rename_identifier(
         copy_project_for_validation(project_dir, tmp_project)
         (tmp_project / file).write_text(new_source)
 
-        # ast.parse only proves the renamed file is grammatically valid
-        # Python, not that every reference it makes still resolves --
-        # real bug this caught: renaming a class reference
-        # (ChatOpenAI -> ChatAnthropic) without also renaming the
-        # *import statement's own module path* it appeared in produced
-        # `from langchain_openai import ChatAnthropic`, a real
-        # ImportError the instant anything ran it. A project with no
-        # test suite covering this file (true of the real case this was
-        # caught against) means pytest below would never have imported
-        # it either, silently reporting success on broken code. On
-        # failure here, the mechanical rename genuinely wasn't enough --
-        # fall back to a real LLM rewrite rather than report a failure
-        # with no path forward; this is the one real generation cost
-        # this otherwise-free path can incur, and only when it's earned.
         try:
             check_python_imports(file, cwd=str(tmp_project))
         except SyntaxCheckError as e:
-            # Before paying for a full rewrite: the mechanical rename got
-            # everything else right, so try fixing ONLY the broken import
-            # block first -- same "locate the one region actually wrong,
-            # regenerate just that, splice back" technique already proven
-            # for TEXT_BLOCK_EDIT, applied to whichever line span the
-            # import statements themselves occupy (see import_repair.py).
-            # Real waste this avoids: a 33-line file whose only real
-            # breakage is one import line previously paid for the *entire*
-            # file as both input and output to fix it.
             on_step(
                 "GENERATE",
                 f"mechanical rename left an inconsistent reference ({e}) -- trying a narrow import fix first...",
@@ -895,18 +1074,6 @@ def _run_rename_identifier(
                 import_block = "\n".join(lines[start - 1 : end])
                 import_fix_gen = generate_import_fix(file_path=file, import_block=import_block, error=str(e))
                 new_import_block = import_fix_gen["code"].rstrip("\n")
-                # A narrow import-only fix is only actually consistent if
-                # every name the OLD (broken) import block bound is either
-                # still bound by the new one, or genuinely unused
-                # elsewhere in the file -- otherwise the fix just moved
-                # the breakage into the body instead of resolving it. Real
-                # bug this catches: reverting "from xai import XAI" back
-                # to "from openai import OpenAI" is a valid import-line
-                # fix in isolation, but a body call site of "XAI(...)"
-                # (inside a function, so check_python_imports's own plain
-                # `import module` never executes it, and no test suite
-                # necessarily covers it either) would silently stay
-                # broken -- committed as success, a real observed case.
                 body_after_span = "\n".join(lines[end:])
                 orphaned = _imported_names(import_block) - _imported_names(new_import_block)
                 orphaned = {name for name in orphaned if re.search(rf"\b{re.escape(name)}\b", body_after_span)}
@@ -921,7 +1088,7 @@ def _run_rename_identifier(
                         check_python_imports(file, cwd=str(tmp_project))
                         fixed_source = candidate
                     except SyntaxCheckError:
-                        (tmp_project / file).write_text(new_source)  # restore before falling back
+                        (tmp_project / file).write_text(new_source)
 
             if fixed_source is None:
                 on_step("GENERATE", "narrow import fix didn't resolve it -- falling back to a full rewrite...")
@@ -940,7 +1107,7 @@ def _run_rename_identifier(
                     vm=vm,
                     target_file=target_file,
                     classification_gen=classification_gen,
-                    language="python",  # this whole function's own import-fix path is Python-only
+                    language="python",
                 )
 
             new_source = fixed_source
@@ -1383,11 +1550,6 @@ def _run_create_files(
 
     for path in file_paths:
         on_step("GENERATE", f"generating {path}...")
-        # also_link_current_file means the new file's own content should
-        # be informed by the file it's meant to work with (e.g. a .env's
-        # keys should match what chatbot.py actually reads) -- the current
-        # file's real content rides along as reference material, not as
-        # something being edited here.
         file_request = (
             f"{request}\n\nFor reference, here is the current content of {current_file} "
             f"this new file relates to:\n\n{current_source}"
@@ -1399,19 +1561,10 @@ def _run_create_files(
             file_request += binary_artifact_instructions(path)
         gen = generate_full_file(file_path=path, user_request=file_request)
         if is_binary:
-            # gen["code"] is a script that BUILDS the real file (e.g.
-            # via openpyxl), not the file itself -- see binary_artifact.py.
-            # Real failure this fixes: "make new excel file and add the
-            # data of Agentic AI" produced a file literally named
-            # "Agentic_AI.xlsx" whose actual bytes were that Python
-            # script, never executed.
             on_step("GENERATE", f"running generated script to materialize {path}...")
             try:
                 files[path] = generate_binary_artifact_base64(gen["code"], path)
             except BinaryArtifactError as e:
-                # Every generation spent so far (including this failed
-                # one) cost real tokens -- fold all of it in rather than
-                # report a cheaper-than-real failure.
                 spent = gens + [gen]
                 run_gen = {
                     "model": spent[0]["model"],
@@ -1473,10 +1626,6 @@ def _run_create_files(
             "latency_ms": sum(g["latency_ms"] for g in gens),
         }
         if gens
-        # A pure folder-only request (e.g. "make a folder called
-        # frontend") never enters the loop above at all -- nothing to
-        # generate, so nothing to fold beyond the classification call
-        # (_fold_prior_generation below) that already decided to escalate.
         else {"model": "n/a (folder-only create, no LLM call)", "input_tokens": 0, "cached_tokens": 0,
               "output_tokens": 0, "total_tokens": 0, "latency_ms": 0}
     )
@@ -1503,7 +1652,7 @@ def _run_create_files(
     on_step("SYNTAX", f"checking {len(files)} generated file(s) parse...")
     for path, content in files.items():
         if is_binary_artifact_target(path):
-            continue  # already a real, successfully-materialized binary -- base64 text isn't source to parse
+            continue
         try:
             check_syntax(content, filename=path)
         except SyntaxCheckError as e:
@@ -1515,7 +1664,7 @@ def _run_create_files(
             return metadata
 
     for path, content in files.items():
-        if not is_binary_artifact_target(path):  # no meaningful diff/preview for real binary bytes
+        if not is_binary_artifact_target(path):
             on_preview({"new_file_content": content, "file": path})
 
     with tempfile.TemporaryDirectory() as tmp:
@@ -1546,9 +1695,6 @@ def _run_create_files(
 
     if require_confirmation:
         metadata["result"]["status"] = "awaiting_confirmation"
-        # A pure folder-only request has no file for the confirm-bar tab
-        # to attach to -- the frontend can't fetch/preview a directory
-        # (or a real binary file) the way it does plain-text content.
         metadata["file"] = next((p for p in file_paths if not is_binary_artifact_target(p)), None)
         pending_confirmations.stash(
             run_id,
@@ -1575,7 +1721,7 @@ def _run_create_files(
     storage.put_json(f"projects/{project_id}/benchmarks/{run_id}.json", metadata)
     for path, content in files.items():
         write_file_content(project_dir / path, path, content)
-        if not is_binary_artifact_target(path):  # no meaningful per-symbol metadata for a binary artifact
+        if not is_binary_artifact_target(path):
             write_file_metadata(project_dir, path, content)
     for path in folder_paths:
         (project_dir / path.rstrip("/")).mkdir(parents=True, exist_ok=True)
@@ -1656,9 +1802,6 @@ def run_edit(
 
     project_dir = Path(project_dir).resolve()
     target_file = project_dir / file
-    # Lowercased so "Core" and "core" (same directory on a case-insensitive
-    # filesystem like macOS's default) can't silently fork into two
-    # unrelated version histories just because of how it was typed.
     project_id = project_id or project_dir.name.lower()
 
     if _project_dir_is_this_engine(project_dir):
@@ -1672,6 +1815,17 @@ def run_edit(
 
     if not target_file.exists():
         raise FileNotFoundError(f"target file not found: {target_file}")
+    if target_file.is_dir():
+        raise IsADirectoryError(f"'{file}' is a directory, not a file -- name a specific file inside it to edit")
+
+    narrowed_test_target = _effective_test_target(test_target, project_dir, file)
+    if narrowed_test_target != test_target:
+        on_step(
+            "TEST",
+            f"test target '.' narrowed to '{narrowed_test_target}' -- validating against this file's own "
+            "tests, not the entire project directory",
+        )
+        test_target = narrowed_test_target
 
     storage = get_storage()
     vm = VersionManager(storage, project_id)
@@ -1680,45 +1834,16 @@ def run_edit(
     try:
         original_source = target_file.read_text()
     except UnicodeDecodeError:
-        # Real crash this replaces: editing a real .xlsx leaked a raw
-        # "UnicodeDecodeError: 'utf-8' codec can't decode byte 0xc7..."
-        # straight to the user. Binary formats (spreadsheets, databases,
-        # images, ...) need their own read/write layer this project
-        # doesn't have yet -- fail with a clear, honest reason instead of
-        # an exception message that looks like an internal bug.
         raise ValueError(
             f"'{file}' is a binary file -- this project can only edit plain-text files "
             "(code, .csv, .sql, config, markdown, ...) right now. Spreadsheets (.xlsx), "
             "databases (.db/.sqlite), and other binary formats aren't supported yet."
         )
-    # "python" for .py (the proven, docstring-aware ast path); otherwise
-    # whatever Tree-sitter grammar the extension maps to, so the same
-    # localize/apply pipeline that used to hard-fail on a non-Python file
-    # (ast.parse() on `public class Foo {` raises SyntaxError) now indexes
-    # it properly instead. None (unrecognized extension) degrades to "no
-    # symbols found" rather than guessing at Python syntax -- UNLESS the
-    # content itself is real Python despite the extension (a ".db" file
-    # that's actually the Python script that *builds* a database, a real
-    # observed case): looks_like_python() is deliberately strict (needs a
-    # real def/class/import, not just anything ast.parse() accepts) so a
-    # plain CSV's rows -- also syntactically valid Python by coincidence
-    # -- never gets misdetected this way.
     language = "python" if file.endswith(".py") else detect_language(file)
     if language is None and looks_like_python(original_source):
         language = "python"
 
     if not confirm_symbol:
-        # "rename X to Y" needs to see neither X's nor any caller's body
-        # to be renamed correctly -- the request itself already says
-        # what to rename and what to call it. Real waste this avoids:
-        # "replace name of function of oauthAuthorizationCodeFlow to
-        # oauthAuthorizationFlow" pulled in that function's *and*
-        # main()'s full bodies as localized context just to decide
-        # something the request's own wording already settled, then
-        # paid a real LLM call to restate them. Skips localization,
-        # context building, and the classification call entirely --
-        # find_rename_target already confirmed old_name is a real,
-        # unambiguous symbol before this ever fires.
         rename_target = find_rename_target(original_source, request, language)
         if rename_target:
             old_name, new_name = rename_target
@@ -1744,21 +1869,10 @@ def run_edit(
 
     multi_delete_targets = None
     if not confirm_symbol and is_delete_intent(request):
-        # "delete tan, sec and cos" names three distinct, deliberate
-        # targets, not one ambiguous one -- find_delete_candidates' broad
-        # substring search can't tell the two apart (it matched 10
-        # symbols for that exact request). Checked first, strictly: only
-        # fires when every named target resolves to exactly one exact,
-        # unambiguous symbol; otherwise falls through to the existing
-        # single-target path unchanged.
         multi_delete_targets = find_multi_delete_targets(original_source, request, language)
         if multi_delete_targets is None:
             delete_candidates = find_delete_candidates(original_source, request, language)
             if not delete_candidates and is_whole_file_delete_target(file, request):
-                # No real symbol inside the file matches -- the request
-                # means the file itself. Zero LLM cost either way, so
-                # short-circuit here rather than fall through to a
-                # symbol-level delta the model has nothing real to build.
                 return _run_whole_file_delete(
                     project_dir=project_dir,
                     file=file,
@@ -1790,45 +1904,37 @@ def run_edit(
                     ],
                 }
             if len(delete_candidates) == 1:
-                # Already fully determined -- exactly one real symbol matches
-                # the delete target, nothing left to disambiguate. Real waste
-                # observed: "remove the subtract function" against a file
-                # where that name is unique still spent a full LLM call (585
-                # tokens, real $) reconstructing a DELETE whose shape
-                # find_delete_candidates had already pinned down for free.
-                # Falls into the exact same zero-LLM path a human's
-                # needs_selection pick takes below -- still gated by
-                # require_confirmation (the web UI's default) exactly like
-                # every other edit, so nothing is written without a human
-                # reviewing the actual diff first; this only removes the
-                # wasted *generation* call, not the review step.
                 only = delete_candidates[0]
                 confirm_symbol = only.name
                 confirm_symbol_type = only.symbol_type
                 confirm_symbol_line = only.start_line
 
     if not confirm_symbol and not multi_delete_targets and (language is None or not language_has_symbol_concept(language)):
-        # This language's own grammar has no function/class concept at
-        # all (markdown, json, yaml, csv, html, css, ini, dotenv, ...),
-        # OR the file's format wasn't recognized at all (language is
-        # None -- e.g. a literal "Dockerfile" with no extension for
-        # detect_language to key off of). Either way index_symbols
-        # already returns [] for it, so STRUCTURED_EDIT's classification
-        # call (its whole premise is "REPLACE/INSERT/DELETE on a
-        # function/class, or escalate") could only ever answer
-        # "escalate" here, every single time -- skip straight past it.
-        # Still worth localizing, just via
-        # analyzer/text_blocks.py's LLM-free section locator (markdown
-        # headings, [section] headers, YAML top-level keys, or
-        # blank-line paragraphs) instead of function/class matching --
-        # when it confidently finds ONE relevant block, only that block
-        # is sent and regenerated, not the whole file. Real waste this
-        # closes: "add retrieval types in the notes part" against a
-        # 30-line README used to pay ~1045 tokens for the classification
-        # call's system prompt, then regenerate all 30 lines, for a
-        # change that only ever touched its 3-line "### Notes" section.
         if use_hybrid_retrieval:
             on_step("RETRIEVE", "block name-match + BM25 + vector retrieval, then fusing rankings...")
+        matched_blocks = locate_text_blocks(original_source, request, language)
+        if len(matched_blocks) > 1:
+            on_step(
+                "LOCALIZE",
+                f"{len(matched_blocks)} blocks relevant ({', '.join(b.name for b in matched_blocks)}) -- "
+                "skipping structured-edit classification",
+            )
+            return _run_multi_text_block_edit(
+                project_dir=project_dir,
+                file=file,
+                request=request,
+                test_target=test_target,
+                project_id=project_id,
+                base_version=base_version,
+                original_source=original_source,
+                blocks=matched_blocks,
+                require_confirmation=require_confirmation,
+                on_step=on_step,
+                on_preview=on_preview,
+                storage=storage,
+                vm=vm,
+                target_file=target_file,
+            )
         block = locate_text_block(original_source, request, language, use_hybrid=use_hybrid_retrieval)
         if block:
             on_step("LOCALIZE", f"'{block.name}' block unambiguous -- skipping structured-edit classification")
@@ -1868,16 +1974,6 @@ def run_edit(
         )
 
     if not confirm_symbol and not multi_delete_targets:
-        # Optional, opt-in-by-config pre-classification (retrieval/jev_router.py):
-        # a fast, type-safe TypeSafe AI Jev call answers "what kind of request is
-        # this" from the request's own wording alone, before context-building or
-        # STRUCTURED_EDIT's own classification generation ever runs. Only acted
-        # on for the two kinds ("question", "whole_file") whose handlers need
-        # nothing beyond the request + this file's current source -- exactly
-        # what Jev itself saw -- and only above its own confidence bar; anything
-        # else (not configured, low confidence, any failure) returns None and
-        # falls straight through to the existing pipeline, completely
-        # unchanged, same as if this check were never here.
         jev_kind = classify_request_kind(request)
         if jev_kind in DISPATCHABLE_KINDS:
             on_step("LOCALIZE", f"Jev classified this as '{jev_kind}' -- skipping structured-edit classification")
@@ -1908,11 +2004,6 @@ def run_edit(
             )
 
     if confirm_symbol or multi_delete_targets:
-        # The target(s) are already fully determined -- no ambiguity left
-        # to resolve and no wording left for a model to interpret, so
-        # skip localization and the LLM call entirely rather than spend
-        # tokens asking GPT to reconstruct a delta whose shape is already
-        # known.
         if multi_delete_targets:
             names = ", ".join(s.name for s in multi_delete_targets)
             on_step("LOCALIZE", f"{len(multi_delete_targets)} targets unambiguous -- skipping localization")
@@ -1937,11 +2028,6 @@ def run_edit(
                 }
             ]
             candidate_symbols = [confirm_symbol]
-            # Only set when the picked candidate's line disambiguates a
-            # name defined more than once -- find_symbol's prefer_line,
-            # threaded through validate_targets below exactly like the
-            # normal (non-confirmed) path already does for locate_candidates'
-            # own picks.
             candidate_lines = {confirm_symbol: confirm_symbol_line} if confirm_symbol_line is not None else {}
 
         delta_dict = {"schema_version": "1.0", "base_version": base_version, "operations": operations}
@@ -1964,32 +2050,13 @@ def run_edit(
         }
     else:
         if use_hybrid_retrieval:
-            # Same wording `iee find`'s own hybrid retrieval step uses --
-            # real gap this closes: build_context runs BM25+vector fusion
-            # silently (a pure function, no on_step of its own), so a
-            # human watching the step log had no visible confirmation it
-            # ran at all, even though it was (use_hybrid_retrieval
-            # defaults True for the web UI) -- looked indistinguishable
-            # from hybrid never having fired.
             on_step("RETRIEVE", "symbol + BM25 + vector retrieval, then fusing rankings...")
         ctx = build_context(original_source, request, language=language, use_hybrid=use_hybrid_retrieval)
         if ctx["candidate_symbols"]:
             no_match_label = None
         elif ctx["context_lines"] < ctx["total_lines"]:
-            # No confident symbol match, but build_context's compact
-            # fallback (imports + a bare name index, no bodies) still
-            # kicks in -- context_lines < total_lines proves the whole
-            # file was NOT sent, even though no candidate was found. The
-            # old message here claimed "using whole file" unconditionally
-            # whenever no symbol matched, which was true before that
-            # fallback existed but has been wrong (and misleading) ever
-            # since -- a real run with context_lines=8/total_lines=51
-            # logged "using whole file" while actually sending 8 lines.
             no_match_label = "none, using imports + name index only"
         else:
-            # Genuine last resort: build_context had nothing at all to
-            # build a compact fallback from (no imports, no other named
-            # symbols), so it truly fell through to the raw file.
             no_match_label = "none, using whole file"
         on_step(
             "LOCALIZE",
@@ -2005,12 +2072,6 @@ def run_edit(
             base_version=base_version,
         )
 
-        # The model itself recognized this can't be a REPLACE/INSERT/DELETE
-        # on a named symbol at all (see structured_edit.py's prompt) --
-        # not a keyword/language list here deciding for it. Its usage from
-        # *this* call still cost real tokens, so it's threaded through
-        # (classification_gen) rather than silently dropped from the final
-        # metadata's totals.
         escalate = gen["delta_dict"].get("escalate") or {}
         kind = escalate.get("kind")
         if kind == "whole_file":
@@ -2082,14 +2143,6 @@ def run_edit(
                 classification_gen=gen,
             )
         if kind == "delete_file":
-            # Reached when the request meant the whole file but didn't
-            # match is_whole_file_delete_target's narrow, zero-LLM-cost
-            # fast path (e.g. "please delete this file" -- the leading
-            # word isn't a bare delete verb, or extra wording didn't
-            # match the real filename) -- the model itself recognized it
-            # instead. Costs real tokens (this call already happened),
-            # but still routes through the exact same safe pipeline
-            # (test-conflict check, human review) as the free path.
             on_step("GENERATE", "model escalated: this deletes the whole file, not a symbol in it...")
             return _run_whole_file_delete(
                 project_dir=project_dir,
@@ -2126,12 +2179,6 @@ def run_edit(
                 use_joern=use_joern,
             )
 
-    # The exact occurrence locate_candidates already resolved for each
-    # name (matters only when a bare name is duplicated, e.g. the same
-    # method repeated across classes) -- threaded through every later
-    # find_symbol lookup so that resolution can't get re-decided
-    # differently, or refused as ambiguous a second time, from the bare
-    # name alone.
     prefer_lines = ctx.get("candidate_lines") or {}
 
     run_id = f"run-{uuid.uuid4().hex[:8]}"
@@ -2174,10 +2221,6 @@ def run_edit(
             metadata["operations"] = [op.to_dict() for op in delta.operations]
 
             if not delta.operations:
-                # The model looked at the real target and decided there's
-                # nothing to do -- e.g. asked to remove something that's
-                # already gone. That's a legitimate outcome, not a failure:
-                # no file change, no new version, but still a success.
                 metadata["result"]["status"] = "success"
                 metadata["result"]["no_op"] = True
                 metadata["result"]["retry_count"] = attempt
@@ -2194,18 +2237,10 @@ def run_edit(
                 content_shown_for=set(ctx["candidate_symbols"]),
             )
 
-            # Attach the exact original-file line range each operation
-            # touches -- validate_targets already confirmed every target/
-            # anchor resolves uniquely, so these lookups can't hit
-            # AmbiguousSymbolError here.
             symbols = index_symbols(original_source, language)
             for op_dict, op in zip(metadata["operations"], delta.operations):
                 t = op.target
                 if op.operation in ("REPLACE", "DELETE"):
-                    # DELETE never auto-resolves a delegate pair -- see
-                    # find_symbol's docstring. Matches validate_targets'
-                    # own choice above so this lookup (already guaranteed
-                    # to resolve, per the comment below) can't diverge.
                     allow_delegate = op.operation == "REPLACE"
                     sym = find_symbol(
                         symbols, t.symbol_type, t.symbol_name, prefer_lines.get(t.symbol_name), original_source, allow_delegate
@@ -2217,30 +2252,10 @@ def run_edit(
                         op_dict["line_range"] = {"after_line": anchor.end_line}
                     else:
                         op_dict["line_range"] = {"after_line": len(original_source.splitlines())}
-                    # INSERT's declared symbol_name is never actually used to
-                    # apply the change (only `anchor` is) -- the model can
-                    # and sometimes does write it inconsistent with what
-                    # `content` really defines. Correct the *displayed* name
-                    # to match reality rather than trusting an unused label.
                     actual_name = defined_symbol_name(op.content, language)
                     if actual_name and actual_name != t.symbol_name:
                         op_dict["target"]["symbol_name"] = actual_name
 
-            # A REPLACE that changes a symbol's own def-name (a rename
-            # bundled inside a broader edit, not the dedicated mechanical
-            # rename path elsewhere in this file) only ever touches that
-            # symbol's own span -- any OTHER reference to the old name
-            # elsewhere in the file is untouched by apply_delta and would
-            # stay stale under the new name. Real bug this closes: "also
-            # rename ask_all to ask_everyone" bundled with an unrelated
-            # change renamed only the def line, leaving `self.ask_all(...)`
-            # elsewhere in the same file calling a name that no longer
-            # exists -- syntactically valid, semantically broken, and
-            # committed as a plain success because the test suite never
-            # exercised that call path. Mechanically sweep every
-            # remaining whole-word occurrence to the new name (the same
-            # regex the dedicated mechanical rename path already uses)
-            # rather than trust generation to have done it.
             pending_renames = []
             for op_dict, op in zip(metadata["operations"], delta.operations):
                 if op.operation != "REPLACE":
@@ -2306,11 +2321,6 @@ def run_edit(
             metadata["change_ratio"] = change_ratio
 
             if change_ratio == 0:
-                # The delta declared operations (e.g. a REPLACE that
-                # regenerated a symbol byte-identical to what was already
-                # there) but the applied result matches the original file
-                # exactly -- nothing to version. Same "real change, or not"
-                # gate the empty-operations no_op path above already uses.
                 metadata["result"]["status"] = "success"
                 metadata["result"]["retry_count"] = attempt
                 metadata["result"]["no_op"] = True
@@ -2347,9 +2357,6 @@ def run_edit(
             metadata["new_version"] = version_id
 
             if attempt:
-                # Keep the attempt that actually succeeded in the per-attempt
-                # history too, but the canonical, unsuffixed delta -- the one
-                # versions/{v}.json's delta_id points at -- is always this one.
                 _persist_run(storage, project_id, run_id, gen["delta_dict"], metadata, attempt=attempt)
             _persist_run(storage, project_id, run_id, gen["delta_dict"], metadata)
 
@@ -2361,23 +2368,11 @@ def run_edit(
             failure_class = _classify_failure(e)
             failure_detail = str(e)[:2000]
 
-            # This attempt's delta is evidence either way -- store it
-            # before deciding whether to repair or give up (doc section 3:
-            # "always store the edit the same internal way").
             _persist_run(storage, project_id, run_id, gen.get("delta_dict"), metadata, attempt=attempt)
             metadata["repair_history"].append(
                 {"attempt": attempt, "failure_class": failure_class, "failure_detail": failure_detail}
             )
 
-            # The compact context (bare names, no bodies) was proven
-            # insufficient for this request -- a repair round-trip would
-            # only hand the model that same limited context again and
-            # hope it picks escalate:{"kind":"whole_file"} on its own.
-            # Observed not to: it gave up instead (empty operations,
-            # reported as a safe but unhelpful no-op), leaving the user's
-            # request unfulfilled. Since the fix is already known
-            # mechanically -- send the real file -- escalate straight to
-            # whole-file regeneration instead of gambling on a retry.
             if isinstance(e, UnseenReplaceTargetError):
                 on_step("GENERATE", "REPLACE target's body was never shown -- escalating to whole-file regeneration...")
                 return _run_whole_file_edit(
@@ -2398,11 +2393,6 @@ def run_edit(
                     language=language,
                 )
 
-            # A pytest COLLECTION error (interrupted before a single test
-            # even ran) in some file other than the one just edited can
-            # never be caused by, or fixed by retrying, this delta --
-            # short-circuit rather than burn the full repair budget
-            # repeating an identical, unrelated failure.
             if failure_class == "TEST_FAILURE":
                 unrelated_file = _unrelated_collection_error_file(failure_detail, file)
                 if unrelated_file:
@@ -2418,21 +2408,6 @@ def run_edit(
                     _persist_run(storage, project_id, run_id, gen.get("delta_dict"), metadata)
                     return metadata
 
-            # A delete that breaks an existing test is a genuine conflict,
-            # not a fixable mistake -- there's no "wrong content" for a
-            # repair prompt to correct, only code elsewhere (a test, a
-            # caller) that still depends on what was asked to be removed.
-            # Real case: "remove add operation" correctly deleted `add`,
-            # which broke test_calculator.py's own test_add() (an
-            # ImportError, not a logic bug in the edit) -- repair "fixed"
-            # that failure the only way it structurally could: by
-            # regenerating `add` right back, silently reverting the
-            # user's actual request while still reporting plain success
-            # (change_ratio 0, buried in a `note` field). Same reasoning
-            # the confirm_symbol branch below already applies to a
-            # confirmed delete, extended here to a delete the model chose
-            # on its own -- checked generally (every operation in the
-            # failed delta is DELETE), not by name or file.
             delete_only = bool(delta and delta.operations and all(op.operation == "DELETE" for op in delta.operations))
             if delete_only and failure_class == "TEST_FAILURE":
                 metadata["result"]["status"] = "failed"
@@ -2448,14 +2423,6 @@ def run_edit(
                 _persist_run(storage, project_id, run_id, gen.get("delta_dict"), metadata)
                 return metadata
 
-            # A confirmed delete's shape is fully determined -- there's
-            # nothing an LLM repair attempt could productively change if
-            # it fails (e.g. the confirmed symbol no longer exists because
-            # the file changed between the disambiguation prompt and this
-            # request). Retrying would just spend tokens asking the model
-            # to guess at a delta that was never generated by it in the
-            # first place, and ctx has no "context" key on this path since
-            # localization was skipped -- fail immediately instead.
             if attempt >= MAX_REPAIR_ATTEMPTS or confirm_symbol:
                 metadata["result"]["status"] = "failed"
                 metadata["result"]["retry_count"] = attempt

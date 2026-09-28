@@ -57,16 +57,6 @@ def _imports_block(source: str, language: str = "python") -> str:
     return "\n".join("\n".join(lines[start - 1 : end]) for start, end in ranges)
 
 
-# Measured on a real 39-symbol file: showing every parameter on every
-# entry added 90 tokens (127 -> 217, +71%) to this one line alone --
-# genuinely useful per entry, but it compounds linearly with symbol
-# count and starts fighting the token-cost goal on a large file, exactly
-# where the compact name line matters most. Below this count, the
-# absolute cost stays small enough that full detail is worth it; at or
-# above it, entries fall back to bare names (decorators still shown --
-# rare enough not to compound the same way, and a framework route/
-# lifecycle decorator is often the only real way to identify a symbol
-# without a body at all).
 _MAX_SYMBOLS_FOR_PARAM_DETAIL = 20
 
 
@@ -192,33 +182,8 @@ def build_context(source: str, user_request: str, language: str = "python", use_
     total_lines = len(source.splitlines())
     candidates = locate_candidates(source, user_request, language=language)
     if use_hybrid:
-        # Runs even when name/docstring matching found nothing at all --
-        # that's exactly the case BM25/vector retrieval exist to cover
-        # (a request sharing only rare body words, or a paraphrase, with
-        # the right symbol), not just a tiebreak among matches locate_
-        # candidates already found.
         candidates = _hybrid_rerank(source, user_request, language, candidates)
 
-    # Always also check body-content matches, even when name/docstring
-    # matching (or hybrid rerank) already found something -- a compound
-    # request ("also rename X to Y" + "change temperature to 0.5") can
-    # name one target literally while a second target only shares a word
-    # with some OTHER symbol's body text, never its name/docstring or the
-    # first target's own name. Real bug this closes: gating this fallback
-    # behind "candidates is empty" meant that second target's content was
-    # never shown to the model at all once the first target was found by
-    # name -- not escalated, not refused, just silently never addressed,
-    # reported as a plain success. Any body match whose span overlaps a
-    # symbol already selected adds nothing new and is dropped. A body
-    # match sharing an already-selected symbol's NAME is also dropped,
-    # never added as a second entry: two same-named symbols are exactly
-    # the duplicate-definition disambiguation locate_candidates' own
-    # class-mention/caller/semantic tiebreak already resolves down to
-    # one -- candidate_lines below assumes at most one occurrence per
-    # name, and a real regression here (a second, different "tan" from a
-    # class the request never mentioned) silently overwrote the already-
-    # correctly-resolved occurrence's line, applying the edit to the
-    # wrong one.
     existing_names = {c.name for c in candidates}
     for extra in locate_candidates_by_body(source, user_request, language=language):
         if extra.name in existing_names:
@@ -237,9 +202,6 @@ def build_context(source: str, user_request: str, language: str = "python", use_
         context = "\n\n".join(p for p in pieces if p)
         return {
             "context": context or source,
-            # No specific candidate symbol was identified -- still False,
-            # even though the compact context below is smaller than the
-            # raw file. This flag means "found a target," not "sent less."
             "used_localization": False,
             "total_lines": total_lines,
             "context_lines": sum(len(p.splitlines()) for p in pieces if p) or total_lines,
@@ -255,10 +217,6 @@ def build_context(source: str, user_request: str, language: str = "python", use_
         pieces.append(names_line)
     context = "\n\n".join(p for p in pieces if p)
 
-    # Count actual content lines per piece, not the joined string's line
-    # count -- "\n\n".join() inserts a blank separator line between pieces
-    # that isn't real content, and counting it made context_lines exceed
-    # total_lines on small files (misleadingly looking like a bug).
     context_lines = sum(len(p.splitlines()) for p in pieces if p)
 
     return {
@@ -267,12 +225,5 @@ def build_context(source: str, user_request: str, language: str = "python", use_
         "total_lines": total_lines,
         "context_lines": context_lines,
         "candidate_symbols": [s.name for s in candidates],
-        # The exact occurrence locate_candidates picked for each name --
-        # matters when a bare name is duplicated (e.g. the same method
-        # repeated across classes) and locate_candidates already resolved
-        # which one is meant. Threading this through to find_symbol at
-        # validate/apply time means that resolution doesn't need to be
-        # (and can't accidentally be) re-decided differently a second
-        # time from a bare name alone.
         "candidate_lines": {s.name: s.start_line for s in candidates},
     }

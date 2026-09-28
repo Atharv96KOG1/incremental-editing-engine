@@ -19,8 +19,6 @@ _TOKEN_RE = re.compile(r"[a-z0-9]+")
 
 
 def _tokenize(text: str) -> List[str]:
-    # snake_case and camelCase both split into their word parts, so
-    # "build_knowledge_base" and "BuildKnowledgeBase" tokenize the same way.
     spaced = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", " ", text)
     return _TOKEN_RE.findall(spaced.lower())
 

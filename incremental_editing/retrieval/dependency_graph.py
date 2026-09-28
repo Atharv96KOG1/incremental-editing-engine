@@ -36,11 +36,6 @@ def _called_names(tree: ast.AST) -> List[str]:
 def _callees_for(sym: RepoSymbol) -> List[str]:
     if sym.language == "python":
         try:
-            # A method's snippet is sliced with its original class-body
-            # indentation still on it; ast.parse() needs a standalone
-            # statement starting at column 0, so dedent first. Without this,
-            # every nested method silently failed to parse (IndentationError
-            # is a SyntaxError subclass) and looked like it called nothing.
             tree = ast.parse(textwrap.dedent(sym.source))
         except SyntaxError:
             return []

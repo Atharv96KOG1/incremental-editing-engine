@@ -23,10 +23,10 @@ from tree_sitter_language_pack import detect_language_from_path, get_parser
 @dataclass
 class RawSymbol:
     name: str
-    symbol_type: str  # "function" | "class"
+    symbol_type: str
     start_line: int
     end_line: int
-    start_column: int = 0  # 0-indexed column of the symbol's own start line, for re-indentation
+    start_column: int = 0
 
 
 def detect_language(filename: str) -> Optional[str]:
@@ -35,20 +35,6 @@ def detect_language(filename: str) -> Optional[str]:
 
 def _classify(node_type: str) -> Optional[str]:
     t = node_type.lower()
-    # A call site like Java's method_invocation also contains "method" --
-    # restrict to definition/declaration-shaped node types so a *call* to
-    # helper() is never mistaken for a *definition* of it. "item" covers
-    # Rust (function_item/struct_item -- neither contains "declaration"/
-    # "definition"/"specifier" at all, verified via a direct grammar
-    # dump). Bare "function"/"method"/"class" (no suffix at all) covers
-    # Ruby (its function/class definitions really are just "method"/
-    # "class" node kinds) -- safe to allow here because the actual parsed
-    # *node* is additionally required (see extract_symbols's walk()) to
-    # be named with at least one child before this is ever consulted,
-    # which is what excludes the bare keyword literal token every one of
-    # these grammars separately exposes under this exact same type name
-    # (verified: that literal token is always unnamed with zero children,
-    # never a real definition).
     is_decl_shaped = "declaration" in t or "definition" in t or "specifier" in t or "item" in t
     if not is_decl_shaped and t not in ("function", "method", "class"):
         return None
@@ -59,10 +45,6 @@ def _classify(node_type: str) -> Optional[str]:
     return None
 
 
-# Per-language, process-lifetime: a grammar's set of node kinds never
-# changes mid-process, so this is worth caching the same way
-# vector_retriever.py caches embeddings -- language_has_symbol_concept
-# gets called on every STRUCTURED_EDIT request.
 _symbol_concept_cache: dict = {}
 
 
@@ -92,7 +74,7 @@ def language_has_symbol_concept(language: str) -> bool:
                 _classify(lang_obj.node_kind_for_id(i) or "") is not None for i in range(lang_obj.node_kind_count)
             )
         except Exception:
-            _symbol_concept_cache[language] = True  # unknown -- don't assume incapable, fall through normally
+            _symbol_concept_cache[language] = True
     return _symbol_concept_cache[language]
 
 
@@ -126,14 +108,6 @@ def extract_symbols(source: str, language: str) -> List[RawSymbol]:
     symbols: List[RawSymbol] = []
 
     def walk(node) -> None:
-        # Unnamed, childless nodes are keyword/punctuation *tokens*, not
-        # real definitions -- e.g. the literal "class"/"def" keyword
-        # several grammars (Python, JS, Ruby, C++, ...) separately expose
-        # as its own leaf node sharing the exact same bare type name a
-        # real class/method definition container also uses. Excluding
-        # those here is what makes it safe for _classify to accept those
-        # bare names at all (see its own comment) without misfiring on
-        # the keyword token itself.
         if node.is_named and node.child_count > 0:
             symbol_type = _classify(node.type)
             if symbol_type:

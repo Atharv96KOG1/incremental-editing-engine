@@ -139,7 +139,7 @@ def locate_module_level_block(
         if not scored:
             return None
         if len(scored) > 1 and scored[0][0] == scored[1][0]:
-            return None  # tied -- ambiguous, don't guess which region was meant
+            return None
         return scored[0][1]
 
     repo_blocks = _to_repo_symbols(blocks, source)
@@ -157,6 +157,6 @@ def locate_module_level_block(
     if not fused:
         return None
     if len(fused) > 1 and fused[0][1] == fused[1][1]:
-        return None  # tied -- ambiguous, don't guess which region was meant
+        return None
     winner_key = (fused[0][0].name, fused[0][0].start_line)
     return by_key.get(winner_key)

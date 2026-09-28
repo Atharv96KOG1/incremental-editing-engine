@@ -15,11 +15,6 @@ import numpy as np
 from ..config import get_settings
 from .repo_index import RepoSymbol
 
-# content-hash -> normalized embedding vector, process-lifetime. A repo's
-# symbols are mostly unchanged between requests, so a long-running process
-# (`iee serve`) that re-embeds the whole index on every single call is
-# paying real API latency for the same vectors over and over -- only
-# symbols whose own text actually changed need a fresh embedding call.
 _embedding_cache: dict = {}
 
 
@@ -28,19 +23,11 @@ def _document_text(sym: RepoSymbol) -> str:
     return "\n".join(p for p in parts if p)
 
 
-_EMBED_TIMEOUT_SECONDS = 20.0  # a live edit/search request is waiting on this -- a slow or half-broken
-# embeddings endpoint must fail fast, not silently eat a minute-plus (observed: 72s with the client's
-# default ~600s timeout + retries) before whatever called this can fall back to a non-vector signal.
-# 20s, not tighter: normal calls measured 0.2-0.7s, but a real gateway cold start after idle was
-# observed taking just over 8s on its own -- an 8s cap turned that legitimate (if slow) cold start
-# into a guaranteed failure instead of only catching genuine multi-minute hangs. Every caller of this
-# already treats a failure here as "signal unavailable, degrade gracefully" (see locate_repo.py's
-# _safe_vector_ranking and locator.py's _semantic_tiebreak), so the cost of erring generous is a
-# slightly slower single call, not a stuck request.
+_EMBED_TIMEOUT_SECONDS = 20.0
 
 
 def _embed_raw(texts: List[str]) -> np.ndarray:
-    from openai import OpenAI  # lazy import: only needed when a live call is made
+    from openai import OpenAI
 
     settings = get_settings()
     client = OpenAI(

@@ -36,14 +36,6 @@ def build_messages(file_path: str, user_request: str) -> list:
     ]
 
 
-# Given a complete existing file, transform it per the request and hand
-# back the complete new file -- the *edit*-mode counterpart to the
-# create-from-nothing prompt above, used for a file-wide structural/
-# hygiene request (comments, whitespace, docstrings, formatting; see
-# analyzer/locator.is_whole_file_request) that reaches content outside any
-# single symbol's own span, which STRUCTURED_EDIT's per-symbol Delta IR
-# fundamentally can't touch. Not hardcoded to Python -- EDIT already
-# supports every language index_symbols/detect_language recognize.
 _EDIT_SYSTEM_PROMPT = (
     "Code-transformation engine. Given a complete existing file and a request describing a "
     "file-wide change, output ONLY the complete new file content in the file's own language — "
@@ -64,7 +56,7 @@ def build_edit_messages(file_path: str, original_source: str, user_request: str)
 
 
 def _call_llm_for_full_file(messages: list, model: Optional[str]) -> dict:
-    from openai import OpenAI  # lazy import: only needed when a live call is made
+    from openai import OpenAI
 
     settings = get_settings()
     model = model or settings.llm_model

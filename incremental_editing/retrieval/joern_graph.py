@@ -33,25 +33,13 @@ from .repo_index import RepoSymbol
 
 _CACHE_DIR = os.path.expanduser("~/.cache/iee/joern")
 
-# The query is real Scala, in its own .sc file rather than an inline
-# Python string -- Scala's own triple-quoted s"""...""" interpolation
-# collides with Python's triple-quote string literals, so embedding it
-# as a Python string is a real, easy-to-hit bug, not just untidy.
 _QUERY_SCRIPT_PATH = os.path.join(os.path.dirname(__file__), "_joern_query.sc")
 
-# `joern-parse` auto-detects a single dominant language per invocation --
-# pointed at a directory mixing Python and Java, it silently picks one
-# and never looks at the other language's files at all (verified: it
-# built a CPG covering only the .py files in a Python+Java sample
-# directory, no error, no warning). This project indexes symbols
-# per-file by real detected language (`RepoSymbol.language`), so each
-# language actually present gets its own explicit `--language` pass
-# instead of trusting auto-detection to notice a mixed repo.
 _LANGUAGE_TO_JOERN_FLAG = {
     "python": "pythonsrc",
     "java": "javasrc",
     "javascript": "jssrc",
-    "typescript": "jssrc",  # verified: jssrc2cpg parses .ts directly, no separate TS frontend needed
+    "typescript": "jssrc",
     "go": "golang",
     "csharp": "csharpsrc",
     "ruby": "rubysrc",
@@ -109,7 +97,7 @@ def _extract_edges_for_language(project_dir: str, joern_language: str, cache_key
             with open(out_path) as f:
                 return json.load(f)
         except Exception:
-            pass  # cached output is somehow corrupt -- fall through and rebuild
+            pass
 
     try:
         subprocess.run(
@@ -153,13 +141,6 @@ def build_call_graph_via_joern(
 
     os.makedirs(_CACHE_DIR, exist_ok=True)
 
-    # Each language's build is an independent subprocess (its own JVM) --
-    # running them concurrently instead of one after another turns a
-    # multi-language wait into roughly the slowest single language's
-    # time instead of their sum. A cached language returns near-
-    # instantly regardless, so this only matters on a real multi-
-    # language cache miss, but that's exactly the case that used to be
-    # the slowest (measured: ~44s sequential for two languages).
     with ThreadPoolExecutor(max_workers=max(1, len(languages))) as pool:
         futures = {
             pool.submit(

@@ -79,8 +79,42 @@ def test_extract_symbol_metadata_non_python_gets_the_honest_subset():
     assert add.content_hash
 
 
-def test_extract_symbol_metadata_returns_empty_for_unrecognized_language():
-    assert extract_symbol_metadata("whatever text", None) == []
+def test_extract_symbol_metadata_covers_markdown_toml_and_yaml():
+    """Real ask this closes: markdown/TOML/YAML (and any other format
+    with no function/class concept) previously got NO metadata at all --
+    detect_language finds a real language for them, but Tree-sitter's
+    generic function/class node-type heuristic naturally finds nothing
+    in their grammars, so extract_symbol_metadata fell straight to
+    empty. Same block-level fallback as the unrecognized-language case,
+    just reached via a different route (a real language, zero symbols),
+    covering every format this project's own locator already knows how
+    to section, not just files with no detected language."""
+    md = extract_symbol_metadata("# Title\n\nSome text.\n\n## Section\n\nMore.\n", "markdown")
+    assert [s.symbol_type for s in md] == ["block", "block"]
+    assert {s.name for s in md} == {"Title", "Section"}
+
+    toml = extract_symbol_metadata('[server]\nhost = "localhost"\n\n[db]\nurl = "x"\n', "toml")
+    assert {s.name for s in toml} == {"server", "db"}
+    assert all(s.symbol_type == "block" for s in toml)
+
+    yaml = extract_symbol_metadata("service:\n  name: api\n\ndatabase:\n  url: x\n", "yaml")
+    assert {s.name for s in yaml} == {"service", "database"}
+
+
+def test_extract_symbol_metadata_falls_back_to_a_block_for_unrecognized_language():
+    """Real gap this closes: an unrecognized extension (or any format
+    with no function/class concept at all -- markdown, TOML, YAML,
+    HTML, Dockerfile, plain text) used to mean empty metadata, even
+    though analyzer/text_blocks.py's own generic locator already finds
+    real, addressable regions for exactly these files."""
+    symbols = extract_symbol_metadata("whatever text", None)
+    assert len(symbols) == 1
+    assert symbols[0].symbol_type == "block"
+    assert symbols[0].language == "text"
+
+
+def test_extract_symbol_metadata_returns_empty_only_for_a_truly_empty_file():
+    assert extract_symbol_metadata("", None) == []
 
 
 def test_build_project_metadata_merges_call_graph_and_caches(tmp_path, monkeypatch):
@@ -150,9 +184,18 @@ def test_write_file_metadata_reflects_the_files_current_real_content(tmp_path):
     assert names == {"multiply"}
 
 
-def test_write_file_metadata_skips_a_file_with_no_detectable_language(tmp_path):
-    assert write_file_metadata(str(tmp_path), "notes.xyzabc123", "just some plain text\n") is None
-    assert not os.path.exists(per_file_metadata_path(str(tmp_path), "notes.xyzabc123"))
+def test_write_file_metadata_still_writes_for_a_file_with_no_detectable_language(tmp_path):
+    """A file with an unrecognized extension is no longer "no symbols" --
+    extract_symbol_metadata's block-level fallback still finds a real
+    region (here, the whole file as one blank-line paragraph)."""
+    path = write_file_metadata(str(tmp_path), "notes.xyzabc123", "just some plain text\n")
+    assert path is not None
+    assert os.path.exists(per_file_metadata_path(str(tmp_path), "notes.xyzabc123"))
+
+
+def test_write_file_metadata_skips_a_truly_empty_file(tmp_path):
+    assert write_file_metadata(str(tmp_path), "empty.xyzabc123", "") is None
+    assert not os.path.exists(per_file_metadata_path(str(tmp_path), "empty.xyzabc123"))
 
 
 def test_delete_file_metadata_removes_the_json_and_tolerates_a_missing_one(tmp_path):

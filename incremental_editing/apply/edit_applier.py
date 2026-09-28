@@ -36,16 +36,11 @@ def apply_delta(
     symbols = index_symbols(source, language)
     prefer_lines = prefer_lines or {}
 
-    # Resolve every span against the *original* symbol index first, then apply
-    # bottom-to-top so an earlier edit never shifts a later target's line numbers.
     actions = []
     for op in delta.operations:
         t = op.target
         try:
             if op.operation in ("REPLACE", "DELETE"):
-                # DELETE never auto-resolves a delegate pair -- removing
-                # just the implementation would leave its wrapper calling
-                # a method that no longer exists.
                 allow_delegate = op.operation == "REPLACE"
                 sym = _find_symbol(
                     symbols, t.symbol_type, t.symbol_name, prefer_lines.get(t.symbol_name), source, allow_delegate
@@ -58,10 +53,10 @@ def apply_delta(
                     anchor = _find_symbol(symbols, t.symbol_type, t.anchor, prefer_lines.get(t.anchor), source)
                     if anchor is None:
                         raise ApplyError(f"cannot apply INSERT: anchor '{t.anchor}' not found")
-                    pos = anchor.end_line  # insert right after anchor's last line
-                    indent = anchor.indent  # new sibling symbol matches the anchor's nesting level
+                    pos = anchor.end_line
+                    indent = anchor.indent
                 else:
-                    pos = len(lines)  # end of file
+                    pos = len(lines)
                     indent = 0
                 actions.append((pos, "insert", pos, None, indent, op))
             else:
@@ -73,19 +68,6 @@ def apply_delta(
 
     for _, kind, a, b, indent, op in actions:
         if op.operation == "DELETE":
-            # No replacement content -- remove the symbol's lines outright
-            # instead of the old behavior of splicing in a single blank
-            # line where it used to be. Also absorb the whole contiguous
-            # run of blank lines immediately following it (there may be
-            # one, two -- PEP8's convention between top-level defs -- or
-            # none), so deleting a function doesn't leave extra blank
-            # lines at the junction. What's left is exactly the gap that
-            # existed *before* the deleted symbol, which in a consistently
-            # styled file is the same convention -- so this self-adjusts
-            # to whatever blank-line style the file already used, rather
-            # than hardcoding a count. Only ever touches lines directly
-            # adjacent to the deleted symbol -- never reflows blank lines
-            # anywhere else in the file.
             end = b
             while end < len(lines) and lines[end].strip() == "":
                 end += 1

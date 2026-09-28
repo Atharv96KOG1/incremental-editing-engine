@@ -15,7 +15,14 @@ from pathlib import Path
 import pytest
 
 from incremental_editing.analyzer.locator import AmbiguousSymbolError
-from incremental_editing.api.run_pipeline import _classify_failure, _first_defined_name, _TestFailure, run_edit
+from incremental_editing.api.run_pipeline import (
+    _classify_failure,
+    _discover_relevant_test_target,
+    _effective_test_target,
+    _first_defined_name,
+    _TestFailure,
+    run_edit,
+)
 from incremental_editing.apply.edit_applier import ApplyError, apply_delta
 from incremental_editing.delta.schema import DeltaIR
 from incremental_editing.delta.validator import (
@@ -678,6 +685,100 @@ def test_run_edit_fails_fast_on_an_unrelated_test_collection_error_instead_of_bu
     assert metadata["result"]["failure_class"] == "UNRELATED_TEST_COLLECTION_ERROR"
     assert "test_unrelated.py" in metadata["error"]
     assert "unrelated to this edit of 'app.py'" in metadata["error"]
+
+
+def test_discover_relevant_test_target_finds_a_co_located_test_file(tmp_path):
+    (tmp_path / "cores").mkdir()
+    (tmp_path / "cores" / "newchatbot.py").write_text("x = 1\n")
+    (tmp_path / "cores" / "test_newchatbot.py").write_text("def test_x(): pass\n")
+    assert _discover_relevant_test_target(tmp_path, "cores/newchatbot.py") == "cores/test_newchatbot.py"
+
+
+def test_discover_relevant_test_target_finds_a_sibling_tests_directory(tmp_path):
+    (tmp_path / "cores").mkdir()
+    (tmp_path / "cores" / "newchatbot.py").write_text("x = 1\n")
+    (tmp_path / "cores" / "tests").mkdir()
+    (tmp_path / "cores" / "tests" / "test_newchatbot.py").write_text("def test_x(): pass\n")
+    assert _discover_relevant_test_target(tmp_path, "cores/newchatbot.py") == "cores/tests/test_newchatbot.py"
+
+
+def test_discover_relevant_test_target_returns_none_when_nothing_matches(tmp_path):
+    (tmp_path / "cores").mkdir()
+    (tmp_path / "cores" / "newchatbot.py").write_text("x = 1\n")
+    assert _discover_relevant_test_target(tmp_path, "cores/newchatbot.py") is None
+
+
+def test_effective_test_target_narrows_the_broad_default_to_the_files_own_directory(tmp_path):
+    """Real bug this closes: project_dir pointed at a large, cluttered
+    directory (other subprojects, scratch folders) made every edit's
+    own validation pytest '.' the whole thing -- slow, and reporting
+    failures entirely unrelated to the actual change. Narrows down to
+    the edited file's own containing directory instead, real and
+    already-existing, never invented."""
+    assert _effective_test_target(".", tmp_path, "cores/newchatbot.py") == "cores"
+
+
+def test_effective_test_target_prefers_a_discovered_test_file_over_the_directory(tmp_path):
+    (tmp_path / "cores").mkdir()
+    (tmp_path / "cores" / "test_newchatbot.py").write_text("def test_x(): pass\n")
+    assert _effective_test_target(".", tmp_path, "cores/newchatbot.py") == "cores/test_newchatbot.py"
+
+
+def test_effective_test_target_never_touches_an_explicit_non_default_value(tmp_path):
+    assert _effective_test_target("some/explicit/path", tmp_path, "cores/newchatbot.py") == "some/explicit/path"
+
+
+def test_effective_test_target_leaves_a_root_level_file_unchanged(tmp_path):
+    """No narrower real target exists for a file that already lives at
+    the project root -- correctly stays "." rather than narrowing to a
+    no-op that hides the same broad scope under a different label."""
+    assert _effective_test_target(".", tmp_path, "app.py") == "."
+
+
+def test_run_edit_narrows_test_target_away_from_an_unrelated_sibling_directory(tmp_path, monkeypatch):
+    """End-to-end version of the two unit tests above: a real, genuinely
+    broken/unrelated test suite sits in a SEPARATE top-level directory
+    from the file actually being edited -- the old behavior (test_target
+    "." run against the whole project_dir) would have hit it; the
+    narrowed target (just the edited file's own directory) never does."""
+    project_dir = tmp_path / "proj"
+    project_dir.mkdir()
+    (project_dir / "cores").mkdir()
+    (project_dir / "cores" / "app.py").write_text("def add(a, b):\n    return a + b\n")
+    # Unrelated, broken, and in a DIFFERENT directory than the edited file --
+    # the old, unnarrowed "." target would have collected this and failed.
+    (project_dir / "unrelated_dir").mkdir()
+    (project_dir / "unrelated_dir" / "test_broken.py").write_text("from nonexistent_module import whatever\n")
+
+    storage = LocalStorage(root_dir=str(tmp_path / "minio_local_data"))
+    monkeypatch.setattr("incremental_editing.api.run_pipeline.get_storage", lambda: storage)
+    canned_gen = {
+        "raw_json": "{}",
+        "delta_dict": {
+            "schema_version": "1.0",
+            "base_version": "v0",
+            "operations": [
+                {
+                    "operation": "REPLACE",
+                    "target": {"file": "cores/app.py", "symbol_type": "function", "symbol_name": "add"},
+                    "content": "def add(a, b):\n    return a + b + 0\n",
+                }
+            ],
+        },
+        "input_tokens": 10, "output_tokens": 10, "total_tokens": 20, "latency_ms": 1, "model": "test-model",
+    }
+    monkeypatch.setattr("incremental_editing.api.run_pipeline.generate_delta", lambda **kwargs: canned_gen)
+
+    metadata = run_edit(
+        project_dir=project_dir,
+        file="cores/app.py",
+        request="make add also accept a default of 0",
+        test_target=".",
+        project_id="narrow-test-target-test",
+        require_confirmation=False,
+    )
+
+    assert metadata["result"]["status"] == "success"
 
 
 def test_run_edit_asks_before_deleting_an_ambiguous_target(tmp_path, monkeypatch):

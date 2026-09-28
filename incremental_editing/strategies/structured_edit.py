@@ -13,31 +13,6 @@ from ..config import get_settings
 from ..delta.schema import DELTA_SCHEMA_VERSION
 from ..optimization.prompt_compression import compress
 
-# Readable source of truth -- edit THIS when the instructions need to
-# change. SYSTEM_PROMPT below is the compressed form actually sent to the
-# model; compress() itself refuses (raises) if compression would have
-# altered any negation/conditional word's count, so this can't silently
-# drift into meaning something different than what's written here.
-#
-# Deliberately NOT asking for schema_version, base_version, or target.file:
-# all three are already known before this call is ever made (schema_version
-# is a fixed constant; base_version and file_path are both parameters right
-# here), and grep across the whole codebase confirms nothing ever reads the
-# *parsed* delta's own copies of them back out afterward. _fill_known_fields
-# below backfills all three onto the model's response; asking for them here
-# was pure wasted output tokens (billed well above input's rate for this
-# model) on every single call, for values the model was never even the
-# source of truth for.
-#
-# Also deliberately NOT describing the operations/escalate JSON *shape* in
-# here at all anymore (a previous version restated it in full, in JSON-
-# literal form, costing ~150 tokens on every single call): the API call
-# below now enforces STRICT_DELTA_RESPONSE_SCHEMA via response_format's
-# strict json_schema mode (verified live against this project's own
-# gateway), so the shape is a structural guarantee from the API itself,
-# not something the model needs telling in English. Everything left here
-# is the part no schema can express -- the semantic/decision rules for
-# *when* to use which field, not what fields exist.
 _SYSTEM_PROMPT_SOURCE = (
     "Code-editing engine. Context may be a partial file excerpt -- match the language its path's "
     "extension implies, never assume Python. Touch fewest symbols needed; content must be complete, "
@@ -77,19 +52,6 @@ _SYSTEM_PROMPT_SOURCE = (
 
 SYSTEM_PROMPT = compress(_SYSTEM_PROMPT_SOURCE)
 
-# Strict JSON-schema structured output (verified live: this project's own
-# Bifrost gateway supports response_format's strict json_schema mode).
-# Strict mode requires every declared property to be listed in "required"
-# at every level (a field that's merely optional becomes required-but-
-# nullable instead) and additionalProperties:false everywhere -- this is
-# a separate, API-communication-shaped schema from delta.schema.DELTA_JSON_
-# SCHEMA (the lenient, internal post-parse validation schema used
-# elsewhere), not a replacement for it. _strip_strict_nulls below
-# immediately normalizes a parsed response back to the lenient shape
-# (explicit nulls removed) so every downstream consumer -- validate_schema,
-# _fill_known_fields, Operation.from_dict, run_pipeline's own `.get
-# ("escalate") or {}` -- sees exactly the same shape it always has, unaware
-# this exists.
 STRICT_DELTA_RESPONSE_SCHEMA = {
     "type": "object",
     "properties": {
@@ -235,7 +197,7 @@ def build_repair_messages(
 
 
 def _call_llm(messages: list, model: str = None) -> dict:
-    from openai import OpenAI  # lazy import: only needed when a live call is made
+    from openai import OpenAI
 
     settings = get_settings()
     model = model or settings.llm_model
@@ -262,13 +224,6 @@ def _call_llm(messages: list, model: str = None) -> dict:
     raw_json = response.choices[0].message.content
     usage = response.usage
 
-    # Real, measured behavior (verified against the live gateway): an
-    # identical system+context prefix across two calls -- exactly what
-    # every repair retry sends, since only the failure-specific suffix
-    # changes -- gets served up to ~85% from cache on the second call.
-    # Providers bill cached input tokens at a discount; without reading
-    # this field, estimate_cost() charges every repair attempt as if the
-    # whole prompt were freshly computed, overstating its real cost.
     details = getattr(usage, "prompt_tokens_details", None)
     cached_tokens = getattr(details, "cached_tokens", 0) or 0
 

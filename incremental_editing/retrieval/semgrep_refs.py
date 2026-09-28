@@ -22,8 +22,6 @@ import subprocess
 import tempfile
 from typing import Dict, List
 
-# keyword(s) in the request -> a semgrep pattern that structurally confirms
-# the candidate's code actually does that, not just that a word matches.
 _INTENT_PATTERNS = {
     ("validate", "validation", "type", "types"): "isinstance($X, ...)",
     ("raise", "raises", "error", "exception", "exceptions"): "raise $EXC(...)",

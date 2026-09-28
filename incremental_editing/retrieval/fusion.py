@@ -14,7 +14,7 @@ from typing import List, Tuple
 
 from .repo_index import RepoSymbol
 
-_RRF_K = 60  # standard constant from the original Reciprocal Rank Fusion paper
+_RRF_K = 60
 
 
 def _key(sym: RepoSymbol) -> tuple:

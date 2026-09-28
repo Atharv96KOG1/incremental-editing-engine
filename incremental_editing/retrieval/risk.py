@@ -19,7 +19,7 @@ def classify_risk(sym: RepoSymbol) -> str:
     if _HIGH_RISK_KEYWORDS.search(text):
         return "HIGH"
     if sym.symbol_type == "class" and not sym.name.startswith("_"):
-        return "HIGH"  # public API surface -- doc section 20 lists this as HIGH
+        return "HIGH"
     if sym.name.startswith("_"):
         return "LOW"
     return "MEDIUM"

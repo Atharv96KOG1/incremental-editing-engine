@@ -111,9 +111,6 @@ def validate_targets(
                         "(only its bare name), so rewriting it risks silently discarding real content you "
                         "never saw -- escalate:{\"kind\":\"whole_file\"} instead to get its real content first"
                     )
-                # DELETE never auto-resolves a delegate pair -- removing
-                # just the implementation would leave its wrapper calling
-                # a method that no longer exists.
                 allow_delegate = op.operation == "REPLACE"
                 sym = find_symbol(
                     symbols, t.symbol_type, t.symbol_name, prefer_lines.get(t.symbol_name), source, allow_delegate

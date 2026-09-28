@@ -25,10 +25,6 @@ import sys
 import tempfile
 from pathlib import Path
 
-# Extension -> the library the model should use, given directly in the
-# prompt rather than left for it to guess -- all already dependencies of
-# this project's own venv, verified importable before this was written:
-# openpyxl, python-docx, python-pptx, reportlab; sqlite3 is stdlib.
 BINARY_ARTIFACT_LIBRARIES = {
     ".xlsx": "openpyxl", ".xls": "openpyxl",
     ".docx": "python-docx (import docx)",

@@ -194,10 +194,6 @@ def cmd_edit(args: argparse.Namespace) -> None:
     console.rule(f"[bold]edit[/] {file}")
     console.print(f"[dim]{Path(args.project_dir).resolve()}[/dim]")
 
-    # A "remove/delete X" request whose target word matches more than one
-    # real symbol comes back as needs_selection instead of a guess -- ask,
-    # then re-run with the chosen symbol pinned (skips the LLM entirely,
-    # since the delta's shape is fully determined once confirmed).
     confirm_symbol = None
     confirm_symbol_type = None
     confirm_symbol_line = None
@@ -232,10 +228,6 @@ def cmd_edit(args: argparse.Namespace) -> None:
             try:
                 choice = console.input("[bold cyan]select: [/bold cyan]").strip()
             except (EOFError, KeyboardInterrupt):
-                # No interactive terminal to answer from (piped input,
-                # non-interactive script) -- exit cleanly instead of a raw
-                # traceback; nothing was written, so there's nothing to
-                # undo, just nothing further to do without an answer.
                 console.print("\n[dim]no input available -- cancelled.[/dim]")
                 sys.exit(1)
             if not choice.isdigit() or not (1 <= int(choice) <= len(candidates)):
@@ -315,9 +307,6 @@ def cmd_metadata(args: argparse.Namespace) -> None:
     console.print(f"files indexed:   {len(doc['files'])}")
     console.print(f"symbols indexed: {symbol_count}")
     if args.no_cache:
-        # build_project_metadata(use_cache=False) deliberately skips both
-        # reading AND writing the cache file -- claiming a path here when
-        # nothing was actually written to it was a real, misleading bug.
         console.print("written to:      [dim](--no-cache: not written to disk this run)[/dim]")
     else:
         console.print(f"written to:      [dim]{metadata_cache_path(project_dir)}[/dim]")

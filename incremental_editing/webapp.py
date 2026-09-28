@@ -25,7 +25,9 @@ from .api import pending_confirmations
 from .api.create_pipeline import run_create
 from .api.run_pipeline import run_edit
 from .retrieval.locate_repo import locate, locate_best_file
+from .retrieval.repo_index import iter_source_files
 from .storage.minio_client import get_storage
+from .strategies.create_target_classifier import classify_create_intent
 
 app = FastAPI()
 
@@ -34,9 +36,6 @@ FRONTEND_DIST = Path(__file__).parent.parent / "frontend" / "dist"
 if (FRONTEND_DIST / "assets").is_dir():
     app.mount("/assets", StaticFiles(directory=FRONTEND_DIST / "assets"), name="assets")
 
-# Directories never worth showing in the file explorer -- dependency/VCS/
-# cache trees that dwarf the actual project and add nothing a user would
-# ever want to click into.
 _TREE_IGNORE = {
     ".git", "node_modules", "__pycache__", ".pytest_cache", "dist",
     "venv", ".venv", "egg-info", ".mypy_cache", ".ruff_cache",
@@ -96,47 +95,18 @@ def api_file(project_dir: str, path: str) -> dict:
 
 
 class RunRequest(BaseModel):
-    mode: str  # "edit" | "create" | "find"
+    mode: str
     project_dir: str
-    file: Optional[str] = None  # "edit": omit to auto-locate via hybrid retrieval; "find"/"create": n/a or required
+    file: Optional[str] = None
     request: str
     test_target: Optional[str] = None
     project_id: Optional[str] = None
-    # Set when the user already picked one candidate from a prior
-    # "needs_selection" response -- see run_edit's docstring. Resubmitting
-    # with these set skips localization and the LLM call entirely.
-    # confirm_symbol_line is the picked candidate's start_line -- only
-    # meaningful (and only need be sent) when that name is defined more
-    # than once, letting find_symbol resolve the exact occurrence instead
-    # of refusing the confirmed delete as still ambiguous.
     confirm_symbol: Optional[str] = None
     confirm_symbol_type: Optional[str] = None
     confirm_symbol_line: Optional[int] = None
-    # "find" mode only: "off" (default) never resolves the call graph via
-    # Joern; "auto" is the confidence/need gate -- only when this call's
-    # own confidence is low; "on" always does. Real, measured cost when
-    # it does run (~12-45s depending on languages present, dominated by
-    # JVM startup, cached after the first build), and requires joern/
-    # joern-parse installed separately (not a Python dependency).
     use_joern: str = "off"
-    # "edit"/"create" only: pauses right after tests pass but before the
-    # file is actually written, so a human can review the diff/generated
-    # file and Accept or Reject it -- see pending_confirmations.py and
-    # run_edit's matching docstring. Resolved via POST /api/confirm.
     require_confirmation: bool = True
-    # "edit" only: fuses BM25 + vector/semantic retrieval into
-    # localization on top of the normal name/docstring match, like `iee
-    # find`'s hybrid retrieval but scoped to this one file -- see
-    # run_edit's matching docstring. On by default for the web UI (real
-    # embeddings-API cost per request, deliberately not the CLI's
-    # default -- see cli.py's --hybrid flag).
     use_hybrid_retrieval: bool = True
-    # "edit" only: before a mechanical rename, checks for real cross-file
-    # callers via Joern's CPG -- rename_with_subword_fallback only ever
-    # rewrites the one file it's given, so a caller in another file is
-    # otherwise invisible to it. Never blocks the rename, just adds
-    # metadata["cross_file_impact_warning"]. Off by default: a real
-    # ~12-45s+ JVM cost, and requires Joern installed on the server.
     use_joern: bool = False
 
 
@@ -146,10 +116,6 @@ class ConfirmRequest(BaseModel):
 
 
 def _project_id_for(project_dir: str, project_id: Optional[str]) -> str:
-    # Same derivation run_pipeline.run_edit already uses (lowercased so
-    # "Core" and "core" can't fork into two histories on a case-insensitive
-    # filesystem) -- kept identical here so chat history lands in the same
-    # per-project namespace as that project's benchmarks/deltas/versions.
     return project_id or Path(project_dir).resolve().name.lower()
 
 
@@ -256,16 +222,33 @@ async def run(req: RunRequest) -> StreamingResponse:
                 )
             else:
                 file = req.file
+                if file and file.strip() in (".", "./"):
+                    file = None
                 if not file:
-                    # Fast path (symbol+BM25 only, no semgrep, no dependency
-                    # graph) -- those are `iee find`'s exploratory-evidence
-                    # cost, not needed just to pick the edit target, and
-                    # semgrep's per-candidate subprocess spawn was the
-                    # single largest cost on this path.
                     on_step("LOCATE", "no file given -- searching the repository...")
                     project_dir = str(Path(req.project_dir).resolve())
                     file = locate_best_file(project_dir, req.request)
                     if not file:
+                        on_step("LOCATE", "no existing file matches -- checking whether this describes a new file...")
+                        listing = "\n".join(
+                            sorted(str(Path(p).relative_to(project_dir)) for p in iter_source_files(project_dir))
+                        )[:4000]
+                        classification = classify_create_intent(req.request, listing)
+                        if classification["wants_new_file"] and classification["file_path"]:
+                            on_step("LOCATE", f"describes a new file -- creating '{classification['file_path']}'...")
+                            metadata = run_create(
+                                project_dir=Path(req.project_dir),
+                                file=classification["file_path"],
+                                request=req.request,
+                                test_target=req.test_target or None,
+                                project_id=req.project_id,
+                                require_confirmation=req.require_confirmation,
+                                on_step=on_step,
+                                on_preview=on_preview,
+                                classification_gen=classification,
+                            )
+                            events.put({"type": "done", "metadata": metadata})
+                            return
                         events.put({"type": "error", "message": "no file given and hybrid retrieval found no candidate"})
                         return
                     on_step("LOCATE", f"auto-located {file}")
@@ -291,10 +274,10 @@ async def run(req: RunRequest) -> StreamingResponse:
             events.put({"type": "done", "metadata": metadata})
         except (FileNotFoundError, FileExistsError) as e:
             events.put({"type": "error", "message": str(e)})
-        except Exception as e:  # keep the stream alive even on an unexpected crash
+        except Exception as e:
             events.put({"type": "error", "message": f"{type(e).__name__}: {e}"})
         finally:
-            events.put(None)  # sentinel: stream done
+            events.put(None)
 
     threading.Thread(target=worker, daemon=True).start()
 

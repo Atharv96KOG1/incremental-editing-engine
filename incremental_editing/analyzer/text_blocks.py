@@ -23,7 +23,7 @@ from ..retrieval.bm25_retriever import BM25Retriever
 from ..retrieval.fusion import fuse
 from ..retrieval.repo_index import RepoSymbol
 from ..retrieval.vector_retriever import VectorRetriever
-from .locator import SymbolInfo, _words
+from .locator import _GENERIC_LEADING_VERBS, _GENERIC_TYPE_WORDS, SymbolInfo, _words
 
 _HEADING_RE = re.compile(r"^(#{1,6})\s+(.+?)\s*$")
 _TOML_INI_SECTION_RE = re.compile(r"^\[+([^\]]+)\]+\s*$")
@@ -85,20 +85,13 @@ def _html_blocks(source: str) -> List[SymbolInfo]:
     tree = get_parser("html").parse(source_bytes)
     body = _find_element_by_tag(tree.root_node, "body", source_bytes)
     container = body if body is not None else tree.root_node
-    children = [c for c in container.children if c.type == "element"]
+    children = [c for c in container.children if c.type in ("element", "script_element", "style_element")]
     if not children:
         return []
 
     blocks = []
     for idx, el in enumerate(children):
         start_line = el.start_point[0] + 1
-        # Next sibling's own start_point row (0-indexed), used directly
-        # as this block's 1-indexed end line, lands exactly one line
-        # before it starts -- same trick for the last child against
-        # container.end_point[0]: that row is where the container's own
-        # closing tag (e.g. "</body>") STARTS, so using it un-adjusted
-        # stops this block one line short of that closing tag rather
-        # than swallowing it (and anything after it, like "</html>").
         end_line = children[idx + 1].start_point[0] if idx + 1 < len(children) else container.end_point[0]
         blocks.append(
             SymbolInfo(
@@ -112,11 +105,6 @@ def _html_blocks(source: str) -> List[SymbolInfo]:
         )
     return blocks
 
-# language -> (marker pattern, capture group holding the block's name).
-# Only languages with a well-known, unambiguous section marker get one --
-# everything else (Dockerfile, dotenv, plain text, an undetected
-# extension) uses _blocks_from_blank_lines below instead of guessing at
-# a marker that isn't really there.
 _MARKER_LOCATORS = {
     "markdown": (_HEADING_RE, 2),
     "toml": (_TOML_INI_SECTION_RE, 1),
@@ -208,6 +196,56 @@ def _name_match_ranking(blocks: List[SymbolInfo], user_request: str) -> List[tup
     return scored
 
 
+def _body_match_ranking(blocks: List[SymbolInfo], source: str, user_request: str) -> List[tuple]:
+    """Same technique analyzer.locator.locate_candidates_by_body uses for
+    functions: a request word that never appears in any block's NAME
+    (heading/tag) can still appear inside its body -- an HTML <script>
+    or <style> block especially, whose "name" is just "script"/"style",
+    never whatever identifier the request actually names. Returns
+    [(score, block), ...], same shape as _name_match_ranking."""
+    target_words = {w for w in _words(user_request) - _GENERIC_LEADING_VERBS - _GENERIC_TYPE_WORDS if len(w) >= 3}
+    if not target_words:
+        return []
+    lines = source.splitlines()
+    scored = []
+    for block in blocks:
+        body = "\n".join(lines[block.start_line - 1 : block.end_line])
+        hits = len(target_words & _words(body))
+        if hits:
+            scored.append((hits, block))
+    scored.sort(key=lambda pair: pair[0], reverse=True)
+    return scored
+
+
+def locate_text_blocks(source: str, user_request: str, language: Optional[str]) -> List[SymbolInfo]:
+    """Every block whose name OR body content confidently relates to the
+    request -- not just the single best match locate_text_block commits
+    to. Real gap this closes: a rename that spans a markup block and its
+    own inline <script> (an id used both in a tag's attribute and in the
+    JS that references it) genuinely needs BOTH blocks touched in one
+    edit -- "which one was meant" doesn't apply, since neither alone is
+    a complete, correct change. locate_text_block's own single-best
+    design would see this as a tie and refuse.
+
+    Returns [] when nothing scores at all (never a guess when there's no
+    real signal); returns every scoring block otherwise, ranked highest
+    first -- the caller decides what to do with one vs. several (a
+    single-block edit, same as before, or a combined multi-block one).
+    A block that scored only because it shares a request word but isn't
+    actually relevant costs nothing extra: the multi-block prompt
+    already instructs the model to leave an unrelated block's content
+    byte-identical, same as any other unaffected region."""
+    blocks = index_text_blocks(source, language)
+    if len(blocks) < 2:
+        return []
+
+    name_scored = {id(b): s for s, b in _name_match_ranking(blocks, user_request)}
+    body_scored = {id(b): s for s, b in _body_match_ranking(blocks, source, user_request)}
+    matched = [b for b in blocks if id(b) in name_scored or id(b) in body_scored]
+    matched.sort(key=lambda b: max(name_scored.get(id(b), 0), body_scored.get(id(b), 0)), reverse=True)
+    return matched
+
+
 def _to_repo_symbols(blocks: List[SymbolInfo], source: str) -> List[RepoSymbol]:
     """Same RepoSymbol adapter context_builder.py's own _to_repo_symbols
     uses for function/class symbols, here for blocks -- BM25Retriever/
@@ -264,14 +302,14 @@ def locate_text_block(
     call, not free like the fast paths elsewhere in this project."""
     blocks = index_text_blocks(source, language)
     if len(blocks) < 2:
-        return None  # nothing to localize against -- the file is already ~one block
+        return None
 
     scored = _name_match_ranking(blocks, user_request)
     if not use_hybrid:
         if not scored:
             return None
         if len(scored) > 1 and scored[0][0] == scored[1][0]:
-            return None  # tied -- ambiguous, don't guess which section was meant
+            return None
         return scored[0][1]
 
     repo_blocks = _to_repo_symbols(blocks, source)
@@ -289,7 +327,7 @@ def locate_text_block(
     if not fused:
         return None
     if len(fused) > 1 and fused[0][1] == fused[1][1]:
-        return None  # tied -- ambiguous, don't guess which section was meant
+        return None
     winner_key = (fused[0][0].name, fused[0][0].start_line)
     return by_key.get(winner_key)
 

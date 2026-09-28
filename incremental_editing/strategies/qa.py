@@ -31,7 +31,7 @@ def build_messages(file_path: str, source: str, question: str) -> list:
 
 
 def generate_answer(file_path: str, source: str, question: str, model: Optional[str] = None) -> dict:
-    from openai import OpenAI  # lazy import: only needed when a live call is made
+    from openai import OpenAI
 
     settings = get_settings()
     model = model or settings.llm_model

@@ -7,21 +7,8 @@ import sys
 
 from ..retrieval.repo_index import project_ignore_dirs
 
-NO_TESTS_COLLECTED = 5  # pytest's own exit code for "nothing matched test_target"
+NO_TESTS_COLLECTED = 5
 
-# Directories a real project's OWN test suite is never plausibly running
-# against, safe to skip on every single syntax/import/test validation
-# copy: version control history (can be the majority of a real repo's
-# on-disk size), tool caches, and this engine's own operational
-# artifacts (.aider-venv is a full separate Python virtualenv,
-# minio_local_data/iee_metadata are this engine's own storage/metadata
-# -- never something an edited project's real tests would import).
-#
-# Deliberately NOT node_modules/venv/.venv/vendor/dist/build: a real
-# project's own test suite might genuinely need any of those to run at
-# all (a JS test runner needs node_modules; a project's own venv might
-# be where its test dependencies actually live) -- excluding those would
-# risk a false test failure, which is worse than the copy time saved.
 _VALIDATION_COPY_IGNORE_NAMES = (
     ".git", "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache",
     ".aider-venv", "minio_local_data", "iee_metadata",
@@ -93,8 +80,6 @@ def run_tests(test_target: str, cwd: str, timeout: float = 120) -> dict:
         "passed": _count(r"(\d+) passed"),
         "failed": _count(r"(\d+) failed"),
         "errors": _count(r"(\d+) error"),
-        # No tests to run means nothing to regress -- that's not a failure,
-        # it's an empty check. Only an actual failed/errored run should gate.
         "tests_passed": proc.returncode == 0 or no_tests_collected,
         "no_tests_collected": no_tests_collected,
         "output_tail": "\n".join(output.strip().splitlines()[-20:]),

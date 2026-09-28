@@ -47,7 +47,7 @@ def _find_errors(node, limit: int = 5) -> list:
 
 
 def _check_tree_sitter_syntax(source: str, filename: str, language: str) -> None:
-    from tree_sitter_language_pack import get_parser  # lazy: only needed for non-Python files
+    from tree_sitter_language_pack import get_parser
 
     parser = get_parser(language)
     tree = parser.parse(source.encode("utf-8"))
@@ -62,11 +62,11 @@ def check_syntax(source: str, filename: str = "<generated>") -> None:
         _check_python_syntax(source, filename)
         return
 
-    from tree_sitter_language_pack import detect_language_from_path  # lazy: only needed for non-Python files
+    from tree_sitter_language_pack import detect_language_from_path
 
     language = detect_language_from_path(filename)
     if language is None:
-        return  # unrecognized extension -- nothing we can validate, don't guess
+        return
     _check_tree_sitter_syntax(source, filename, language)
 
 

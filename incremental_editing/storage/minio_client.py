@@ -73,7 +73,7 @@ class LocalStorage(Storage):
 
 class MinioStorage(Storage):
     def __init__(self, endpoint: str, access_key: str, secret_key: str, bucket: str, secure: bool = False):
-        from minio import Minio  # lazy import: only needed when MinIO is actually used
+        from minio import Minio
 
         self.bucket = bucket
         self.client = Minio(endpoint, access_key=access_key, secret_key=secret_key, secure=secure)

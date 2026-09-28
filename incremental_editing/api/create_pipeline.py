@@ -30,7 +30,7 @@ from ..validation.syntax import SyntaxCheckError, check_syntax
 from ..validation.tests import copy_project_for_validation, run_tests
 from ..versioning.version_manager import VersionManager
 from . import pending_confirmations
-from .run_pipeline import _project_dir_is_this_engine
+from .run_pipeline import _fold_prior_generation, _project_dir_is_this_engine
 
 
 def _persist_run(storage, project_id, run_id, gen, metadata):
@@ -47,6 +47,7 @@ def run_create(
     require_confirmation: bool = False,
     on_step: Callable[[str, str], None] = lambda tag, msg: None,
     on_preview: Callable[[dict], None] = lambda data: None,
+    classification_gen: Optional[dict] = None,
 ) -> dict:
     """Always returns a metadata dict (check metadata["result"]["status"]).
     Only raises for programmer errors (target file already exists, bad args).
@@ -58,13 +59,19 @@ def run_create(
     right after syntax/tests pass but before the file is written: returns
     early with result.status == "awaiting_confirmation", nothing written
     to disk until `pending_confirmations.resolve` is called -- see that
-    module's docstring and run_pipeline.run_edit's matching parameter."""
+    module's docstring and run_pipeline.run_edit's matching parameter.
+
+    `classification_gen` folds in a prior LLM call's usage (e.g. webapp.py's
+    create_target_classifier, run when edit mode's auto-locate found nothing
+    and this create was dispatched to instead) so the returned cost is
+    honest -- that call's tokens are real, not free just because they
+    happened before this function was ever entered."""
+
+    if not file:
+        raise ValueError("create mode needs a file path -- the File field can't be left blank")
 
     project_dir = Path(project_dir).resolve()
     target_file = project_dir / file
-    # Lowercased so "Core" and "core" (same directory on a case-insensitive
-    # filesystem like macOS's default) can't silently fork into two
-    # unrelated version histories just because of how it was typed.
     project_id = project_id or project_dir.name.lower()
 
     if _project_dir_is_this_engine(project_dir):
@@ -113,13 +120,9 @@ def run_create(
         "validation": {},
         "result": {"status": "pending", "retry_count": 0, "fallback_used": False},
     }
+    _fold_prior_generation(metadata, classification_gen)
 
     if is_binary:
-        # gen["code"] is a script that BUILDS the real file, not the
-        # file itself -- see binary_artifact.py. Actually run it here,
-        # once, rather than write that script out under the real
-        # extension (the exact bug this closes: an "Agentic_AI.xlsx"
-        # that was actually Python source).
         on_step("GENERATE", f"running generated script to materialize {file}...")
         try:
             content = generate_binary_artifact_base64(gen["code"], file)
@@ -167,17 +170,6 @@ def run_create(
 
     if require_confirmation:
         metadata["result"]["status"] = "awaiting_confirmation"
-        # Real bug this fixes: nulling this out for a binary artifact
-        # (kept, presumably, since there's no live text preview/diff to
-        # show for one -- see the on_preview skip above) also broke the
-        # web UI's OWN tab association: markPendingConfirmation(metadata
-        # .files || metadata.file, ...) got null, tagged no tab with
-        # this run's id, so a binary artifact's already-open tab (typed
-        # into the File field before submitting) never learned this run
-        # existed at all -- silently keeping whatever stale placeholder
-        # it showed before the file was created, forever. The real path
-        # is needed here regardless of is_binary; nothing about showing
-        # a preview requires hiding it.
         metadata["file"] = file
         pending_confirmations.stash(
             run_id,
@@ -204,6 +196,6 @@ def run_create(
     _persist_run(storage, project_id, run_id, gen, metadata)
 
     write_file_content(target_file, file, content)
-    if not is_binary:  # no meaningful per-symbol metadata for a binary artifact
+    if not is_binary:
         write_file_metadata(project_dir, file, content)
     return metadata

@@ -22,9 +22,6 @@ enforces this itself (raises rather than silently violating it), and
 import re
 from collections import Counter
 
-# Removing any of these changes what an instruction *means*, not just its
-# length -- "do not X" and "do X" are opposites, not a paraphrase of each
-# other. Never add a word here that a real prompt needs shortened instead.
 PROTECTED_WORDS = frozenset(
     {
         "not", "no", "never", "only", "except", "must", "always",
@@ -33,9 +30,7 @@ PROTECTED_WORDS = frozenset(
 )
 
 _DROP_PATTERNS = [
-    # standalone articles -- "a partial excerpt" -> "partial excerpt"
     re.compile(r"\b(a|an|the)\b\s+", re.IGNORECASE),
-    # hedging/filler adverbs that add no instruction content
     re.compile(r"\b(just|really|basically|actually|simply|essentially)\b\s*", re.IGNORECASE),
 ]
 
@@ -44,9 +39,6 @@ _WORD_RE = re.compile(r"[a-z]+(?:'[a-z]+)?")
 
 def _protected_word_counts(text: str) -> Counter:
     words = _WORD_RE.findall(text.lower())
-    # "isn't"/"doesn't"/"wasn't" etc. all carry a negation via "n't" --
-    # count that suffix once per contraction rather than needing every
-    # verb+n't combination listed individually in PROTECTED_WORDS.
     counts = Counter(w for w in words if w in PROTECTED_WORDS or w.endswith("n't"))
     return counts
 

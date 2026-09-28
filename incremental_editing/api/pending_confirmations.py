@@ -1,5 +1,5 @@
-"""Shared in-memory store for edit/create runs paused right before COMMIT
-by `require_confirmation=True` -- the human-in-the-loop accept/reject gate
+"""Shared store for edit/create runs paused right before COMMIT by
+`require_confirmation=True` -- the human-in-the-loop accept/reject gate
 the web UI uses (the CLI never sets this flag, so its behavior is
 unchanged: always auto-commits, exactly as before this existed).
 
@@ -9,22 +9,41 @@ written yet (that only ever happens in `resolve()` below, or in the
 original auto-commit path when `require_confirmation` is False). So
 "reject" is just forgetting the pending state; nothing to undo.
 
-In-memory only, deliberately -- lost on a server restart, same POC-scope
-tradeoff `local_storage_dir` already makes elsewhere in this project (see
-storage/minio_client.py). Not meant to survive a multi-instance or
-long-lived deployment; a single `iee serve` process is this project's
-only target so far.
-"""
+An in-memory dict by default -- fine for one long-lived `iee serve`
+process, same POC-scope tradeoff `local_storage_dir` already makes
+elsewhere (see storage/minio_client.py), but lost on restart and
+invisible to any second worker process. Set `REDIS_URL` in `.env` to
+back this with Redis instead -- same "endpoint set -> use it" switch
+MinIO already uses, zero code change for either caller (`stash`/
+`resolve` are the only two operations either backend needs: one write,
+one read-and-delete), with a TTL (`pending_confirmation_ttl_seconds`,
+default 24h) so an abandoned run doesn't linger forever."""
 
+import json
 from pathlib import Path
-from typing import Callable, Dict, List
+from typing import Callable, Dict, List, Optional
 
 from ..analyzer.metadata_builder import delete_file_metadata, write_file_metadata
+from ..config import get_settings
 from ..storage.minio_client import get_storage
 from ..strategies.binary_artifact import is_binary_artifact_target, write_file_content
 from ..versioning.version_manager import VersionManager
 
 _pending: Dict[str, dict] = {}
+_redis_client = None
+
+
+def _redis():
+    global _redis_client
+    if _redis_client is None:
+        import redis
+
+        _redis_client = redis.from_url(get_settings().redis_url, decode_responses=True)
+    return _redis_client
+
+
+def _redis_key(run_id: str) -> str:
+    return f"iee:pending_confirmation:{run_id}"
 
 
 def stash(run_id: str, kind: str, **fields) -> None:
@@ -46,13 +65,30 @@ def stash(run_id: str, kind: str, **fields) -> None:
     `folders: List[relative_path]` -- bare directories with no content
     (e.g. a plain "make a folder called frontend" request), mkdir'd on
     accept alongside whatever real files this run also touches."""
-    _pending[run_id] = {"kind": kind, **fields}
+    payload = {"kind": kind, **fields}
+    settings = get_settings()
+    if settings.redis_url:
+        _redis().set(_redis_key(run_id), json.dumps(payload), ex=settings.pending_confirmation_ttl_seconds)
+    else:
+        _pending[run_id] = payload
+
+
+def _pop_pending(run_id: str) -> Optional[dict]:
+    settings = get_settings()
+    if settings.redis_url:
+        key = _redis_key(run_id)
+        raw = _redis().get(key)
+        if raw is None:
+            return None
+        _redis().delete(key)
+        return json.loads(raw)
+    return _pending.pop(run_id, None)
 
 
 def resolve(run_id: str, accept: bool, on_step: Callable[[str, str], None] = lambda tag, msg: None) -> dict:
-    pending = _pending.pop(run_id, None)
+    pending = _pop_pending(run_id)
     if pending is None:
-        raise KeyError(f"no pending confirmation for run_id={run_id!r} (already resolved, or server restarted)")
+        raise KeyError(f"no pending confirmation for run_id={run_id!r} (already resolved, expired, or server restarted)")
 
     metadata = pending["metadata"]
     if not accept:
@@ -107,12 +143,8 @@ def resolve(run_id: str, accept: bool, on_step: Callable[[str, str], None] = lam
 
     for path, content in files.items():
         write_file_content(project_dir / path, path, content)
-        if not is_binary_artifact_target(path):  # no meaningful per-symbol metadata for a binary artifact
+        if not is_binary_artifact_target(path):
             write_file_metadata(project_dir, path, content)
-    # "create_files" only: bare folder paths (e.g. "frontend/") with no
-    # content to write, never generated/reviewed as a diff -- see
-    # run_pipeline._run_create_files' docstring for why a trailing "/"
-    # means this instead of a placeholder file.
     for path in pending.get("folders", []):
         (project_dir / path.rstrip("/")).mkdir(parents=True, exist_ok=True)
     return metadata

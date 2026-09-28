@@ -36,23 +36,17 @@ from ..retrieval.multilang_symbols import detect_language, extract_import_lines,
 from ..retrieval.repo_index import RepoSymbol, build_repo_index, iter_source_files
 from .locator import _words as _real_words
 from .locator import looks_like_python
+from .text_blocks import index_text_blocks
 
-# A visible, browsable folder -- not a dot-prefixed cache dir. This is
-# meant to be looked at directly (a human asking "show me the metadata
-# file"), not just machine-internal state like Joern's ~/.cache/iee/joern.
 _CACHE_DIR = os.path.expanduser("~/iee-metadata")
 
-# Per-file, per-commit metadata folder -- lives inside the project itself
-# (not ~/iee-metadata/, which is the one-JSON-per-*project* snapshot
-# above) so it's browsable right next to the code it describes. One JSON
-# per source file, mirroring that file's own relative path.
 _PER_FILE_METADATA_DIRNAME = "iee_metadata"
 
 
 @dataclass
 class SymbolMetadata:
     name: str
-    symbol_type: str  # "function" | "class"
+    symbol_type: str
     start_line: int
     end_line: int
     line_count: int
@@ -145,25 +139,64 @@ def _index_python_metadata(source: str, lines: List[str]) -> List[SymbolMetadata
     return out
 
 
-def extract_symbol_metadata(source: str, language: str) -> List[SymbolMetadata]:
+def extract_symbol_metadata(source: str, language: Optional[str]) -> List[SymbolMetadata]:
     """Single-file entry point -- no project_dir, no disk cache, no
     call-graph merge (that needs the whole repo indexed first, see
     build_project_metadata). Same per-symbol fields except calls/
     called_by_count (always empty/0 here). Costs the same one AST/
     Tree-sitter parse `index_symbols()` already pays per call; this
-    reads a couple more fields off the same parse, not a second one."""
+    reads a couple more fields off the same parse, not a second one.
+
+    Falls back to block-level metadata (see _index_text_block_metadata)
+    whenever symbol extraction finds nothing at all -- either because
+    this language has no function/class concept to begin with (markdown,
+    TOML, YAML, HTML, Dockerfile, plain text, ...) or this particular
+    file just happens to have none. Real gap this closes: metadata was
+    silently empty for an entire class of real files -- the same files
+    analyzer/text_blocks.py already knows how to localize into real,
+    addressable regions for editing, just never reflected in the
+    persisted metadata describing them."""
     lines = source.splitlines()
+    symbols: List[SymbolMetadata] = []
     if language == "python":
         try:
-            return _index_python_metadata(source, lines)
+            symbols = _index_python_metadata(source, lines)
         except SyntaxError:
-            return []
-    if language is None:
-        return []
+            symbols = []
+    elif language is not None:
+        try:
+            symbols = _index_multilang_metadata(source, lines, language)
+        except Exception:
+            symbols = []
+    return symbols or _index_text_block_metadata(source, lines, language)
+
+
+def _index_text_block_metadata(source: str, lines: List[str], language: Optional[str]) -> List[SymbolMetadata]:
+    """Block-level metadata (a markdown heading, a TOML/INI section, a
+    YAML top-level key, an HTML tag, or a blank-line paragraph) for a
+    file with no function/class-level metadata at all -- same generic
+    locator analyzer/text_blocks.py already uses for localization,
+    reused directly here rather than a second, format-specific pass."""
     try:
-        return _index_multilang_metadata(source, lines, language)
+        blocks = index_text_blocks(source, language)
     except Exception:
         return []
+    out: List[SymbolMetadata] = []
+    for b in blocks:
+        snippet = "\n".join(lines[b.start_line - 1 : b.end_line])
+        out.append(
+            SymbolMetadata(
+                name=b.name,
+                symbol_type="block",
+                start_line=b.start_line,
+                end_line=b.end_line,
+                line_count=b.end_line - b.start_line + 1,
+                language=language or "text",
+                keywords=sorted(set(_words(b.name.replace("_", " ").replace(".", " ").replace("#", " ")))),
+                content_hash=_content_hash(snippet),
+            )
+        )
+    return out
 
 
 def _index_multilang_metadata(source: str, lines: List[str], language: str) -> List[SymbolMetadata]:
@@ -226,11 +259,6 @@ def _fingerprint(project_dir: str) -> tuple:
 
 
 def _cache_path(project_dir: str) -> str:
-    # Human-readable, not just a hash: the project folder's own name comes
-    # first so browsing ~/iee-metadata/ shows which file is which project
-    # at a glance -- the short hash suffix only exists to keep two
-    # different projects that happen to share a folder name from
-    # colliding, not to be the primary identifier.
     name = os.path.basename(os.path.abspath(project_dir).rstrip(os.sep)) or "root"
     key = hashlib.sha256(os.path.abspath(project_dir).encode("utf-8")).hexdigest()[:8]
     return os.path.join(_CACHE_DIR, f"{name}-{key}.json")
@@ -264,34 +292,16 @@ def build_project_metadata(project_dir: str, use_cache: bool = True) -> dict:
         except (UnicodeDecodeError, OSError):
             continue
         lines = source.splitlines()
-
-        if rel.endswith(".py"):
-            language = "python"
-            try:
-                symbols_by_file[rel] = _index_python_metadata(source, lines)
-            except SyntaxError:
-                continue
-        else:
-            from ..retrieval.multilang_symbols import detect_language
-
-            language = detect_language(rel)
-            if language is None:
-                continue
-            try:
-                symbols_by_file[rel] = _index_multilang_metadata(source, lines, language)
-            except Exception:
-                continue
+        language = "python" if rel.endswith(".py") else detect_language(rel)
+        symbols_by_file[rel] = extract_symbol_metadata(source, language)
 
         file_info[rel] = {
-            "language": language,
+            "language": language or "text",
             "file_hash": _content_hash(source),
             "total_lines": len(lines),
             "imports": _file_imports(source, language),
         }
 
-    # Reuse the existing native call graph for called_by_count/calls --
-    # same technique dependency_graph.py already uses, applied once here
-    # instead of recomputed separately by every caller.
     repo_symbols: List[RepoSymbol] = build_repo_index(project_dir)
     call_graph = build_call_graph(repo_symbols)
 
@@ -365,15 +375,17 @@ def write_file_metadata(project_dir: str, rel_path: str, source: str) -> Optiona
     instead of buried inside one combined document, and refreshed on
     every edit instead of only on an explicit `iee metadata` call.
 
-    Returns None (writes nothing) for a file whose language can't be
-    determined at all -- there are no symbols to index, so an empty
-    metadata file would just be noise."""
+    Returns None (writes nothing) only when there's truly nothing to
+    index at all (an empty file) -- an unrecognized extension no longer
+    means "no symbols," since extract_symbol_metadata's own block-level
+    fallback (a Dockerfile/.env's blank-line paragraphs, for instance)
+    still finds real, addressable regions even with language=None."""
     language = _detect_language(rel_path, source)
-    if language is None:
-        return None
-
     lines = source.splitlines()
     symbols = extract_symbol_metadata(source, language)
+    if not symbols:
+        return None
+
     symbol_dicts = []
     for sym in symbols:
         d = asdict(sym)
@@ -382,7 +394,7 @@ def write_file_metadata(project_dir: str, rel_path: str, source: str) -> Optiona
 
     document = {
         "file": rel_path,
-        "language": language,
+        "language": language or "text",
         "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "total_lines": len(lines),
         "file_hash": _content_hash(source),

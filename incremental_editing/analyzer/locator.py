@@ -29,12 +29,12 @@ class AmbiguousSymbolError(Exception):
 @dataclass
 class SymbolInfo:
     name: str
-    symbol_type: str  # "function" | "class"
+    symbol_type: str
     start_line: int
     end_line: int
     docstring_first_line: Optional[str]
-    indent: int  # column of the def/class keyword -- 0 for module-level, 4+ for a class method
-    parent_class: Optional[str] = None  # enclosing class name, or None for a module-level symbol
+    indent: int
+    parent_class: Optional[str] = None
 
 
 def _index_python_symbols(tree: ast.AST) -> List[SymbolInfo]:
@@ -136,7 +136,7 @@ def _is_trivial_delegate(source: str, wrapper: "SymbolInfo", impl: "SymbolInfo")
         return False
     lines = source.splitlines()
     body_lines = [l for l in lines[wrapper.start_line - 1 : wrapper.end_line] if l.strip()]
-    if len(body_lines) < 2 or len(body_lines) > 3:  # def line + a one-or-two-line body only
+    if len(body_lines) < 2 or len(body_lines) > 3:
         return False
     body_text = "\n".join(body_lines[1:])
     return bool(re.search(rf"\b{re.escape(impl.parent_class)}\s*\.\s*{re.escape(impl.name)}\s*\(", body_text))
@@ -230,16 +230,6 @@ def defined_symbol_name(content: Optional[str], language: str = "python") -> Opt
     if len(syms) == 1:
         return syms[0].name
     if not syms:
-        # A bare class-method snippet (JS/TS/Java/C#/C++ method-shorthand
-        # -- valid only as a class member, never standalone) parses to
-        # zero symbols on its own, not a real "can't determine" case --
-        # the content unambiguously defines exactly one method, direct
-        # parsing just can't see it without class context. Retry once,
-        # wrapped in a minimal synthetic class body, and take the one
-        # real symbol found inside it (excluding the wrapper class
-        # itself). Never reached for a language whose own top-level
-        # function/method syntax already parses standalone (Python,
-        # Go, Ruby, ...) since those already return a match above.
         try:
             wrapped = extract_symbols(f"class {_DEFINED_NAME_WRAPPER_CLASS} {{\n{content}\n}}", language)
         except Exception:
@@ -251,14 +241,6 @@ def defined_symbol_name(content: Optional[str], language: str = "python") -> Opt
 
 _WORD_RE = re.compile(r"[a-z0-9]+")
 
-# Common words carry no relevance signal on their own. A real run's request
-# ("add the association types like aglomarative and divisive") shared
-# nothing with a class's docstring except the word "and" -- that alone
-# scored high enough to select the class as a "candidate", and since the
-# class contained nearly every method in the file, "localized" context
-# degenerated into essentially the whole file. Stopwords are excluded from
-# every overlap comparison so a coincidental shared "and"/"the"/"a" can
-# never be mistaken for actual relevance.
 _STOPWORDS = {
     "a", "an", "the", "and", "or", "of", "in", "on", "to", "for", "with",
     "is", "are", "be", "it", "this", "that", "as", "at", "by", "from",
@@ -267,12 +249,6 @@ _STOPWORDS = {
     "here", "you", "your", "we", "our", "i", "me", "my",
 }
 
-# Common imperative verbs that are also plausible function names -- "add" the
-# instruction ("add a new function") is indistinguishable in isolation from
-# "add" the symbol reference. Only suppressed when leading the request AND
-# uncorroborated (see locate_candidates): a real-world log showed "add sin
-# inverse function" pulling in add()'s entire body purely because "add" is
-# the request's own first word, wasting input tokens on an irrelevant symbol.
 _GENERIC_LEADING_VERBS = {
     "add", "remove", "delete", "update", "create", "make", "build", "fix",
     "change", "modify", "edit", "insert", "append", "get", "set", "check",
@@ -362,59 +338,28 @@ def locate_candidates(
         literal_hit = bool(re.search(rf"\b{re.escape(name_lower)}\b", request_lower))
         name_overlap = len(_words(sym.name.replace("_", " ")) & request_words)
         doc_overlap = len(_words(sym.docstring_first_line) & request_words) if sym.docstring_first_line else 0
-        # A literal mention of the *enclosing class* is just as strong a
-        # signal as naming the symbol itself -- it's exactly how a request
-        # disambiguates between two same-named methods in different
-        # classes ("fix Trig's tan method" vs "fix Hyperbolic's tan").
         class_hit = bool(
             sym.parent_class and re.search(rf"\b{re.escape(sym.parent_class.lower())}\b", request_lower)
         )
 
-        # A single-word name matching the request's own leading verb, with
-        # nothing else (no docstring overlap, no name words beyond the bare
-        # match itself) corroborating it, is almost always the instruction
-        # verb, not a reference -- skip it entirely rather than let a common
-        # word alone drag its whole body into context.
         is_leading_generic_verb = name_lower in _GENERIC_LEADING_VERBS and name_lower == leading_word
         corroborated = doc_overlap > 0 or name_overlap > 1 or class_hit
         if is_leading_generic_verb and literal_hit and not corroborated:
             continue
 
-        # No literal name mention, and only one shared word (real content
-        # word, not a stopword) with nothing else corroborating it -- a
-        # real run asked to "add the cot inverse function" and got
-        # atan_inverse's entire body pulled in purely because both names
-        # happen to share "inverse" (arctangent's inverse, not
-        # arccotangent's). A math-heavy file full of similarly-named
-        # "X_inverse" symbols makes a bare single-word overlap alone as
-        # weak a signal as the shared-stopword case already fixed --
-        # requires either a real name mention or more than one overlapping
-        # word/doc hit before a symbol counts as a candidate at all.
         if not literal_hit and not corroborated:
             continue
 
         score = 0
         if literal_hit:
-            score += 5  # literal name mention is the strongest signal
+            score += 5
         if class_hit:
-            score += 5  # naming the enclosing class is just as strong when the method name alone is ambiguous
+            score += 5
         score += name_overlap
         score += doc_overlap
         if score >= min_score:
             scored.append((score, sym))
 
-    # Multiple entries sharing the same NAME are the same logical target
-    # (the same method repeated across classes, or a genuine duplicate
-    # definition) -- never two distinct candidates, so each name collapses
-    # to its single best-scoring occurrence before ranking across
-    # different names. A same-name group already resolved by score (e.g.
-    # a literal class-name mention outscoring the others) just keeps its
-    # top scorer; a group genuinely tied at its own top score (e.g. bare
-    # "add validation to tan" naming no class, exactly the "10-15
-    # similarly-named things in a 5000-line file" case) needs a real
-    # tiebreak -- word overlap alone can't decide, and silently keeping
-    # whichever happened to sort first would pick by file order, not by
-    # what the request means.
     by_name: Dict[str, List[Tuple[int, SymbolInfo]]] = {}
     for score, sym in scored:
         by_name.setdefault(sym.name, []).append((score, sym))
@@ -430,10 +375,6 @@ def locate_candidates(
         if len(tied) == 1:
             winner = tied[0]
         else:
-            # Free tiebreak first: computed lazily, only once a real tie
-            # needs resolving, from data this module already extracts --
-            # zero LLM/embeddings calls. Only reach for the paid semantic
-            # tiebreak if this doesn't produce a single, unique winner.
             if local_called_by is None:
                 local_called_by = _local_called_by_counts(source, symbols, language)
             by_callers = sorted({local_called_by.get(s.name, 0) for s in tied}, reverse=True)
@@ -490,19 +431,6 @@ def locate_candidates_by_body(
             scored.append((hits, sym))
     scored.sort(key=lambda pair: pair[0], reverse=True)
 
-    # Real bug this closes: a class's own line span structurally CONTAINS
-    # every one of its methods, so a match word appearing only inside one
-    # nested method (e.g. "temperature" only inside a constructor) scores
-    # an independent "hit" for the ENCLOSING CLASS too -- entirely
-    # explained by that one method already matching, never a separate
-    # signal. Selecting both then drags every OTHER, unrelated method in
-    # the class into context (and into whatever a REPLACE ends up
-    # restating) for zero additional benefit. Real observed case: "add
-    # regex part and make temperature 0.3" against a class whose
-    # constructor sets the temperature caused the whole class -- three
-    # unrelated methods included -- to get selected and REPLACEd instead
-    # of just the constructor. Whenever one scored symbol's span fully
-    # contains another's, drop the outer (containing) one.
     def _contains(outer: SymbolInfo, inner: SymbolInfo) -> bool:
         return (
             outer is not inner
@@ -515,12 +443,6 @@ def locate_candidates_by_body(
     return [sym for _, sym in filtered[:max_candidates]]
 
 
-# A deletion is destructive and permanent -- guessing which of several
-# similarly-named symbols a vague "remove the X function" means (real
-# case: a file with atan2/atan_inverse/acot_inverse/acos_inverse all
-# present) is worse than just asking. Generic type nouns carry no
-# identifying signal for which symbol is meant, so they're dropped from
-# the target term the same way stopwords already are.
 _DELETE_VERBS = {"remove", "delete"}
 _GENERIC_TYPE_WORDS = {"function", "method", "class", "def", "file"}
 
@@ -566,22 +488,6 @@ def is_whole_file_delete_target(file: str, user_request: str) -> bool:
     return all(w in base or w in stem for w in target_words)
 
 
-# Whether a request is a file-wide structural/hygiene transform (comments,
-# whitespace, docstrings, formatting -- reaching content outside any single
-# symbol's own span, which REPLACE/INSERT/DELETE fundamentally can't touch)
-# or a request for a different programming language entirely used to be
-# decided here by hand-written keyword/regex lists (structural nouns, a
-# fixed language-name catalog, typo-fuzzing via difflib...). That approach
-# can't actually cover "every coding language" or every phrasing -- it's an
-# unwinnable, ever-growing whack-a-mole (comments, then whitespace, then
-# docstrings, then a typo'd verb, then the next language someone asks
-# for...). The model already understands natural language and already
-# knows what "REPLACE a named symbol" can and can't express -- so it
-# classifies this itself now: generate_delta's response can carry an
-# "escalate" field (see structured_edit.py's prompt) instead of empty
-# operations, and run_pipeline.py routes off *that*, not off any keyword
-# list here. Nothing in this module hardcodes a language or a structural
-# keyword anymore.
 
 
 def target_file_for_conversion(file: str, target_extension: str) -> str:
@@ -682,24 +588,14 @@ def find_multi_delete_targets(source: str, user_request: str, language: str = "p
         exact_matches = [s for s in symbols if s.name.lower() in phrase_words]
         distinct_names = {m.name for m in exact_matches}
         if len(distinct_names) != 1:
-            return None  # this phrase isn't a single, confident exact target
+            return None
         name_matches = [m for m in exact_matches if m.name == next(iter(distinct_names))]
         if len(name_matches) != 1:
-            return None  # that name is itself defined more than once -- not safe to auto-resolve here
+            return None
         resolved.append(name_matches[0])
     return resolved
 
 
-# A narrow set of common rename phrasings -- "rename X to Y", "replace
-# [the] name of [the function/method/class/variable] [of] X to/with/by
-# Y" (the redundant trailing "of" tolerated since real requests write it
-# that way: "replace name of function of oauthAuthorizationCodeFlow to
-# oauthAuthorizationFlow"). Deliberately NOT trying to cover every
-# possible rename phrasing -- same reasoning is_delete_intent's narrow
-# verb-first check already applies: when this doesn't match, the
-# request just falls through to the normal (LLM-driven) path unchanged,
-# so a missed phrasing costs nothing beyond not getting the fast path,
-# never a wrong guess.
 _RENAME_RE = re.compile(
     r"^(?:rename|replace)\b"
     r"(?:\s+(?:the\s+)?name\s+of)?"
@@ -737,18 +633,11 @@ def find_rename_target(source: str, user_request: str, language: str = "python")
     symbols = index_symbols(source, language)
     matches = [s for s in symbols if s.name == old_name]
     if len(matches) != 1:
-        return None  # not found, or itself ambiguous (defined more than once) -- let the LLM decide
+        return None
     return old_name, new_name
 
 
 _IDENTIFIER_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
-# Two distinct camelCase/PascalCase split points: a lower/digit directly
-# followed by upper ("buildOpen" -> "build"|"Open"), and an upper run
-# directly followed by [upper, lower] -- the acronym-tail case
-# ("AIClient" -> "AI"|"Client", not "A"|"I"|"Client") -- without the
-# second pattern, a trailing acronym run like "OpenAI" merges into
-# whatever comes after it ("AIClient" as one word) and old_name="openai"
-# can never be found as any single sub-word or consecutive span at all.
 _CASE_TRANSITION_RE = re.compile(r"(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])")
 
 

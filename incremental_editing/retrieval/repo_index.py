@@ -23,9 +23,6 @@ from .multilang_symbols import detect_language, extract_symbols
 _IGNORE_DIRS = {
     ".git", ".venv", "venv", "__pycache__", "node_modules", ".pytest_cache",
     "dist", "build", ".mypy_cache", ".ruff_cache", "minio_local_data",
-    # This project's own per-file metadata output (metadata_builder.py's
-    # write_file_metadata) -- real code is what's indexed, never a JSON
-    # description *of* it.
     "iee_metadata",
 }
 
@@ -52,14 +49,14 @@ def project_ignore_dirs(project_dir: str) -> set:
 
 @dataclass
 class RepoSymbol:
-    file: str  # relative to project root, e.g. "core/agent.py"
+    file: str
     name: str
-    symbol_type: str  # "function" | "class"
+    symbol_type: str
     start_line: int
     end_line: int
     docstring_first_line: Optional[str]
-    source: str  # the symbol's own source text, sliced from its file
-    language: str = "python"  # "python" or a tree-sitter language name, e.g. "java", "go"
+    source: str
+    language: str = "python"
 
 
 def iter_source_files(project_dir: str):
@@ -94,7 +91,7 @@ def _index_multilang_symbols(rel: str, source: str, lines: List[str], language: 
     return symbols
 
 
-_index_cache: dict = {}  # project_dir -> (fingerprint, symbols)
+_index_cache: dict = {}
 
 
 def _fingerprint(project_dir: str) -> tuple:
@@ -149,11 +146,11 @@ def build_repo_index(project_dir: str, use_cache: bool = True) -> List[RepoSymbo
 
         language = detect_language(rel)
         if language is None:
-            continue  # unrecognized extension -- nothing to index, don't guess
+            continue
         try:
             symbols.extend(_index_multilang_symbols(rel, source, lines, language))
         except Exception:
-            continue  # unparseable/unsupported grammar -- skip this file only
+            continue
 
     if use_cache:
         _index_cache[project_dir] = (fingerprint, symbols)
