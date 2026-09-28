@@ -1,7 +1,10 @@
 """Decides whether a request with no existing edit target actually wants
-a brand-new file created, and if so, what it should be named -- the one
-real gap between "auto-locate found nothing" and refusing the request
-outright.
+brand-new file(s)/folder(s) created, and if so, what real path(s) they
+should have -- the one real gap between "auto-locate found nothing" and
+refusing the request outright. Handles a multi-file/folder request (e.g.
+"frontend and backend in separate folders") the same way run_pipeline.
+_run_create_files already does for an escalated edit-mode request --
+one path per real responsibility, never merged into a single file.
 
 Real gap this closes: edit mode with no file selected, and hybrid
 retrieval finding no existing candidate (a genuinely new/near-empty
@@ -27,20 +30,26 @@ from ..config import get_settings
 
 _SYSTEM_PROMPT = (
     "No existing file in this project matched the request below. Decide whether the "
-    "request actually describes creating a brand-new file. If so, propose one real, "
-    "sensible relative file path for it (a real extension, no leading slash, not one of "
-    "the existing paths listed). If the request is ambiguous, or really describes editing "
-    "something that should already exist (just unmatched or misspelled), say no -- never "
-    "guess a path unless the new-file intent is genuinely unambiguous."
+    "request actually describes creating brand-new file(s)/folder(s). If so, propose the "
+    "real relative FILE path(s) needed -- one per real responsibility, never merged (e.g. "
+    "\"frontend and backend in separate folders\" means real files under both frontend/ "
+    "and backend/ -- frontend/index.html, backend/server.py, and so on -- never just the "
+    "two folder names with nothing inside them). A bare path ending in \"/\" with no file "
+    "in it is ONLY for a request that explicitly asks for an empty folder and nothing else "
+    "-- almost never the right answer for a request that describes real functionality. "
+    "Never propose one of the existing paths already listed. If the request is ambiguous, "
+    "or really describes editing something that should already exist (just unmatched or "
+    "misspelled), say no -- never guess paths unless the new-file intent is genuinely "
+    "unambiguous."
 )
 
 _SCHEMA = {
     "type": "object",
     "properties": {
         "wants_new_file": {"type": "boolean"},
-        "file_path": {"type": ["string", "null"]},
+        "paths": {"type": "array", "items": {"type": "string"}},
     },
-    "required": ["wants_new_file", "file_path"],
+    "required": ["wants_new_file", "paths"],
     "additionalProperties": False,
 }
 
@@ -76,7 +85,7 @@ def classify_create_intent(request: str, project_listing: str, model: Optional[s
             "json_schema": {"name": "create_intent", "schema": _SCHEMA, "strict": True},
         },
         temperature=0,
-        max_tokens=200,
+        max_tokens=400,
     )
     latency_ms = int((time.time() - start) * 1000)
     raw = json.loads(response.choices[0].message.content)
@@ -86,7 +95,7 @@ def classify_create_intent(request: str, project_listing: str, model: Optional[s
 
     return {
         "wants_new_file": raw["wants_new_file"],
-        "file_path": raw["file_path"],
+        "paths": raw["paths"],
         "model": model,
         "input_tokens": usage.prompt_tokens,
         "cached_tokens": cached_tokens,

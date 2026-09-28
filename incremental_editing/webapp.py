@@ -22,7 +22,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from .api import pending_confirmations
-from .api.create_pipeline import run_create
+from .api.create_pipeline import run_create, run_create_files
 from .api.run_pipeline import run_edit
 from .retrieval.locate_repo import locate, locate_best_file
 from .retrieval.repo_index import iter_source_files
@@ -234,19 +234,34 @@ async def run(req: RunRequest) -> StreamingResponse:
                             sorted(str(Path(p).relative_to(project_dir)) for p in iter_source_files(project_dir))
                         )[:4000]
                         classification = classify_create_intent(req.request, listing)
-                        if classification["wants_new_file"] and classification["file_path"]:
-                            on_step("LOCATE", f"describes a new file -- creating '{classification['file_path']}'...")
-                            metadata = run_create(
-                                project_dir=Path(req.project_dir),
-                                file=classification["file_path"],
-                                request=req.request,
-                                test_target=req.test_target or None,
-                                project_id=req.project_id,
-                                require_confirmation=req.require_confirmation,
-                                on_step=on_step,
-                                on_preview=on_preview,
-                                classification_gen=classification,
-                            )
+                        paths = classification["paths"]
+                        if classification["wants_new_file"] and paths:
+                            if len(paths) == 1 and not paths[0].endswith("/"):
+                                on_step("LOCATE", f"describes a new file -- creating '{paths[0]}'...")
+                                metadata = run_create(
+                                    project_dir=Path(req.project_dir),
+                                    file=paths[0],
+                                    request=req.request,
+                                    test_target=req.test_target or None,
+                                    project_id=req.project_id,
+                                    require_confirmation=req.require_confirmation,
+                                    on_step=on_step,
+                                    on_preview=on_preview,
+                                    classification_gen=classification,
+                                )
+                            else:
+                                on_step("LOCATE", f"describes {len(paths)} new path(s) -- creating {', '.join(paths)}...")
+                                metadata = run_create_files(
+                                    project_dir=Path(req.project_dir),
+                                    paths=paths,
+                                    request=req.request,
+                                    test_target=req.test_target,
+                                    project_id=req.project_id,
+                                    require_confirmation=req.require_confirmation,
+                                    on_step=on_step,
+                                    on_preview=on_preview,
+                                    classification_gen=classification,
+                                )
                             events.put({"type": "done", "metadata": metadata})
                             return
                         events.put({"type": "error", "message": "no file given and hybrid retrieval found no candidate"})

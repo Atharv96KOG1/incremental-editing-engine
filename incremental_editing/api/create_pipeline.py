@@ -30,7 +30,7 @@ from ..validation.syntax import SyntaxCheckError, check_syntax
 from ..validation.tests import copy_project_for_validation, run_tests
 from ..versioning.version_manager import VersionManager
 from . import pending_confirmations
-from .run_pipeline import _fold_prior_generation, _project_dir_is_this_engine
+from .run_pipeline import _fold_prior_generation, _project_dir_is_this_engine, _run_create_files
 
 
 def _persist_run(storage, project_id, run_id, gen, metadata):
@@ -199,3 +199,65 @@ def run_create(
     if not is_binary:
         write_file_metadata(project_dir, file, content)
     return metadata
+
+
+def run_create_files(
+    project_dir: Path,
+    paths: list,
+    request: str,
+    test_target: Optional[str] = None,
+    project_id: Optional[str] = None,
+    require_confirmation: bool = False,
+    on_step: Callable[[str, str], None] = lambda tag, msg: None,
+    on_preview: Callable[[dict], None] = lambda data: None,
+    classification_gen: Optional[dict] = None,
+) -> dict:
+    """Top-level entry point for creating SEVERAL files/folders in one
+    request with no existing anchor file at all -- the multi-path sibling
+    of `run_create` above, for exactly the case that one can't express:
+    "frontend and backend in separate folders" needs paths under both
+    frontend/ and backend/, never merged into one file, and CREATE mode's
+    own one-file-at-a-time flow has no way to ask for that without N
+    manual mode switches.
+
+    Does the same project_dir/project_id/storage/version setup `run_create`
+    does, then delegates the real work to `run_pipeline._run_create_files`
+    (the same function an escalated EDIT-mode request already uses for
+    this exact shape) with `also_link_current_file=False` and an empty
+    anchor -- there's no existing file to link these new ones to here."""
+    project_dir = Path(project_dir).resolve()
+    project_id = project_id or project_dir.name.lower()
+
+    if _project_dir_is_this_engine(project_dir):
+        on_step(
+            "WARNING",
+            f"project directory ({project_dir}) is this engine's own repository (or inside it) -- "
+            "test validation will run ITS unrelated test suite, not a real project's own, and will "
+            "likely be slow and report unrelated failures. Point PROJECT DIRECTORY at a separate, "
+            "dedicated folder for real use.",
+        )
+
+    os.makedirs(project_dir, exist_ok=True)
+
+    storage = get_storage()
+    vm = VersionManager(storage, project_id)
+    base_version = vm.get_head() or "v0"
+
+    return _run_create_files(
+        project_dir=project_dir,
+        current_file="",
+        current_source="",
+        new_paths=paths,
+        also_link_current_file=False,
+        request=request,
+        test_target=test_target or ".",
+        project_id=project_id,
+        base_version=base_version,
+        language=None,
+        require_confirmation=require_confirmation,
+        on_step=on_step,
+        on_preview=on_preview,
+        storage=storage,
+        vm=vm,
+        classification_gen=classification_gen,
+    )

@@ -353,8 +353,23 @@ export default function App() {
         }
       }
     } catch (err) {
-      setTabs((prev) => prev.map((t) => (relatedPaths.includes(t.path) ? { ...t, confirming: false, confirmError: err.message } : t)))
-      patchMessage(assistantId, { confirming: false, confirmError: err.message })
+      // "no pending confirmation for run_id=..." (api/pending_confirmations.py's
+      // own KeyError wording) means this run is permanently gone -- already
+      // resolved by an earlier click, expired, or the server restarted.
+      // Retrying can never succeed, so the confirm bar must actually clear
+      // (pendingRunId: null), not just show an error and stay clickable
+      // forever. Real bug this closes: a stale confirm bar left the Accept/
+      // Reject buttons live indefinitely, so re-clicking just repeated the
+      // same unresolvable error with no way to dismiss it.
+      const stale = err.message.includes('no pending confirmation')
+      setTabs((prev) =>
+        prev.map((t) =>
+          relatedPaths.includes(t.path)
+            ? { ...t, confirming: false, confirmError: err.message, pendingRunId: stale ? null : t.pendingRunId }
+            : t,
+        ),
+      )
+      patchMessage(assistantId, { confirming: false, confirmError: err.message, confirmStale: stale })
     } finally {
       confirmingRunsRef.current.delete(runId)
     }
@@ -460,6 +475,29 @@ export default function App() {
           preview: null,
           metadata: null,
           error: 'Set a project directory (left sidebar) before sending a request.',
+        },
+      ])
+      setInput('')
+      scrollToEnd()
+      return
+    }
+
+    // Unlike edit mode (which auto-locates a blank File field via hybrid
+    // retrieval), create mode has no such fallback -- a blank field sends
+    // file: null, which the backend can now only refuse cleanly instead
+    // of crashing on (see create_pipeline.py's own guard), but there's no
+    // reason to pay a network round-trip just to learn that.
+    if (config.mode === 'create' && !config.file.trim()) {
+      setMessages((prev) => [
+        ...prev,
+        { id: nextId++, role: 'user', text },
+        {
+          id: nextId++,
+          role: 'assistant',
+          steps: [],
+          preview: null,
+          metadata: null,
+          error: 'Set a file path (left sidebar) before creating a new file.',
         },
       ])
       setInput('')

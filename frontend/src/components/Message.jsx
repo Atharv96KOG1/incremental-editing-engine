@@ -61,7 +61,16 @@ export default function Message({ message, onSelectCandidate, onConfirmRun }) {
             {display?.operations?.length > 0 && <OperationBadges operations={display.operations} />}
             {display?.diff && <DiffView diff={display.diff} />}
             {display?.new_file_content && <CodeBlock code={display.new_file_content} label="Generated file" />}
-            {awaitingConfirmation && (
+            {awaitingConfirmation && message.confirmStale && (
+              // The run is permanently gone (already resolved by an
+              // earlier click, expired, or the server restarted) --
+              // Accept/Reject can never succeed again, so showing them
+              // would just repeat the same unresolvable error forever.
+              <div className="chat-confirm-bar">
+                <span className="chat-confirm-bar-error">{message.confirmError}</span>
+              </div>
+            )}
+            {awaitingConfirmation && !message.confirmStale && (
               <div className="chat-confirm-bar">
                 <span className="chat-confirm-bar-label">
                   {message.metadata.file
