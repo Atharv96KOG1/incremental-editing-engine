@@ -1,23 +1,16 @@
-"""Optional Joern integration -- a real Code Property Graph (CPG) call
-graph, used in place of the native AST-based one (`dependency_graph.py`)
-when cross-file/cross-module accuracy matters more than speed.
+"""Optional Joern integration: a real Code Property Graph (CPG) call graph,
+used instead of the native AST-based one (`dependency_graph.py`) when
+cross-file/cross-module accuracy matters more than speed.
 
-This is a deliberate escalation, not a default. Measured cost building a
-CPG for a 204-line, single-file project: ~12 seconds, dominated by JVM/
-Scala startup, not the actual analysis -- versus the native graph's
-near-instant AST walk. A real project will cost more, not less. Requires
-`joern`/`joern-parse` on PATH: a separate system install (a JDK plus the
-Joern CLI, ~1.7GB), neither of which ships with this project's own
-dependencies. Never used on the fast edit-auto-locate path
-(`locate_best_file`); only reachable from `iee find` when explicitly
-requested via `use_joern=True`, and cached per project directory so the
-cost is paid once, not per request.
+Deliberate escalation, not default: building a CPG costs ~12s+ (JVM/Scala
+startup dominated, a real project costs more) vs the native graph's
+near-instant walk, and requires `joern`/`joern-parse` on PATH (separate
+JDK + Joern install, ~1.7GB). Only reachable via `iee find`'s explicit
+use_joern=True, cached per project directory so the cost is paid once.
 
-Where the native graph is genuinely weaker (its own docstring says so):
-name-based only, no cross-module resolution -- two unrelated `foo`
-functions in different files look identical to it. Joern's CPG resolves
-calls against real per-file method identity, so this closes exactly that
-gap when it's turned on.
+Native graph is name-based only, no cross-module resolution (two unrelated
+`foo` functions in different files look identical); Joern's CPG resolves
+real per-file method identity and closes that gap.
 """
 
 import hashlib
@@ -57,13 +50,10 @@ def is_available() -> bool:
 
 
 def _fingerprint(project_dir: str, language: str, symbols: List[RepoSymbol]) -> str:
-    """Cheap (stat-only) signature of every file in this language, so a
-    cached CPG is invalidated the moment a file it covers actually
-    changes. This tool's entire purpose is editing files that change
-    between requests -- a cache keyed on project path and language alone
-    would silently keep serving a stale CPG (built before the edit) with
-    nothing to ever invalidate it, which is worse than not caching at
-    all. Mirrors `repo_index.py`'s own fingerprint approach."""
+    """Cheap stat-only signature of every file in this language, so a
+    cached CPG invalidates the moment a covered file changes -- keying the
+    cache on path+language alone would silently serve a stale CPG forever.
+    Mirrors `repo_index.py`'s own fingerprint approach."""
     entries = []
     for rel_file in sorted({s.file for s in symbols if s.language == language}):
         try:
@@ -81,13 +71,10 @@ def _cache_key(project_dir: str, language: str, symbols: List[RepoSymbol]) -> st
 
 
 def _extract_edges_for_language(project_dir: str, joern_language: str, cache_key: str, timeout: int) -> Optional[list]:
-    """Runs one joern-parse + query pass for a single forced language and
-    returns its raw edge list, or None if that pass fails -- a failure
-    analyzing one language (e.g. an unsupported/broken frontend) must not
-    lose the languages that did work. `cache_key` already encodes a
-    content fingerprint (see `_fingerprint`), so a hit here means those
-    exact files, byte for byte, were already analyzed -- safe to reuse
-    without re-running the ~10-40s joern-parse + query pass at all."""
+    """Runs one joern-parse + query pass for a single forced language;
+    returns None on failure so one broken language doesn't lose the
+    others. `cache_key` encodes a content fingerprint, so a hit means
+    those exact files were already analyzed."""
     cpg_path = os.path.join(_CACHE_DIR, f"{cache_key}.cpg")
     out_path = os.path.join(_CACHE_DIR, f"{cache_key}_edges.json")
     script_path = os.path.join(_CACHE_DIR, f"{cache_key}_query.sc")
@@ -123,14 +110,10 @@ def build_call_graph_via_joern(
     project_dir: str, symbols: List[RepoSymbol], timeout: int = 300
 ) -> Optional[Dict[str, dict]]:
     """Same {"calls": {...}, "called_by": {...}} shape as
-    dependency_graph.build_call_graph(), resolved via a real CPG instead
-    of name-only AST matching. Runs one joern-parse pass per distinct
-    language actually present among `symbols` (see the module-level note
-    on why auto-detection alone isn't safe for a mixed-language repo).
-    Returns None only if Joern isn't installed at all, or every language
-    present failed to analyze -- a partial result (some languages
-    succeeded, others didn't or aren't Joern-supported) is still
-    returned rather than discarded."""
+    dependency_graph.build_call_graph(), resolved via a real CPG. Runs one
+    joern-parse pass per distinct language present; returns None only if
+    Joern isn't installed or every language failed -- partial results are
+    returned otherwise."""
     if not is_available():
         return None
 

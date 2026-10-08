@@ -17,11 +17,8 @@ class ApplyError(Exception):
 
 
 def _reindent(content: str, indent: int) -> str:
-    """Force `content` to the given indentation column, regardless of
-    whatever indentation the model returned it with. A class method target
-    needs its `def` back at, say, column 4 -- trusting the model to get
-    that right produced silently-wrong output (a de-indented method that
-    Python parses fine but treats as a different, un-nested definition)."""
+    """Forces `content` to `indent` regardless of the model's own indentation --
+    a wrong indent still parses, but silently de-nests the method."""
     dedented = textwrap.dedent((content or "").rstrip("\n")) + "\n"
     if indent == 0:
         return dedented

@@ -85,13 +85,10 @@ def build_multi_block_messages(file_path: str, blocks: List[Tuple[str, str]], us
 
 
 def parse_multi_block_response(raw: str, expected_names: List[str]) -> dict:
-    """Maps each expected block name to its new content, in the order
-    `expected_names` gives (not the order the model happened to return
-    them in, though it's told to preserve it) -- a name the response
-    never mentions at all means the model dropped it; the caller must
-    treat that as a real failure (UnseenReplaceTargetError's own "never
-    silently keep the old content when the model didn't actually
-    address it" contract), not silently reuse the original."""
+    """Maps each expected block name to its new content, in
+    `expected_names`' order. A name the response never mentions means the
+    model dropped it -- callers must treat that as a failure, not
+    silently keep the original."""
     found = {}
     starts = list(_MULTI_BLOCK_START_RE.finditer(raw))
     for i, m in enumerate(starts):

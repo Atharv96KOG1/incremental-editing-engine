@@ -1,18 +1,12 @@
-"""Semgrep as a structural filter (PHOENIX doc section 5: "Semgrep should
-be treated as a structural verification/filtering layer, not another
-semantic retrieval engine"). Two uses:
+"""Semgrep as a structural filter, not a semantic retrieval engine. Two
+uses:
 
-1. `find_call_sites` -- every real call-site of a specific symbol name,
-   structurally verified (an actual call expression, not a name that
-   happens to appear in a comment/string the way plain grep would match).
-
-2. `structural_match_score` -- "meaning-wise" matching: checks whether a
-   candidate's actual code *does* what the request describes (raises
-   exceptions, validates types, loops, calls math functions, ...), not
-   just whether words overlap. A request like "validate the input types"
-   should favor a function whose body actually contains an isinstance/
-   raise TypeError pattern -- grounded in real code structure, which text
-   overlap alone can't tell apart from a coincidental word match.
+1. `find_call_sites` -- every real call-site of a symbol, structurally
+   verified (an actual call expression, not just a name match in a
+   comment/string).
+2. `structural_match_score` -- checks whether a candidate's code actually
+   does what the request describes (raises, validates types, loops, ...),
+   not just word overlap.
 """
 
 import json
@@ -36,12 +30,8 @@ _INTENT_PATTERNS = {
 
 def find_call_sites(project_dir: str, symbol_name: str, language: str = "python", timeout: int = 30) -> List[Dict]:
     """Returns [{"file": ..., "line": ...}, ...] for every structural call
-    site of symbol_name found by semgrep. Returns [] if semgrep itself
-    fails, isn't installed, or times out -- this is a best-effort
-    enrichment the rest of the pipeline never blocks on. `language` should
-    be the target symbol's own language (semgrep's own lang name, e.g.
-    "python"/"java"/"javascript"/"go") -- `foo(...)` is valid call syntax
-    across every C-family/Python-family grammar semgrep supports."""
+    site of symbol_name. Returns [] if semgrep fails, isn't installed, or
+    times out -- best-effort, never blocks the rest of the pipeline."""
     pattern = f"{symbol_name}(...)"
     try:
         proc = subprocess.run(
@@ -66,16 +56,11 @@ def _patterns_for_request(request: str) -> List[str]:
 
 
 def structural_match_score(source_snippet: str, request: str, language: str = "python", timeout: int = 10) -> int:
-    """Runs each request-relevant semgrep pattern against just this one
-    candidate's own source (a temp file, not the whole repo) and counts
-    how many actually match. 0 if the request names no known structural
-    intent, or semgrep can't confirm it -- this only ever adds a signal,
-    never removes one a text/vector retriever already found.
-
-    The intent patterns above (isinstance(...), raise $EXC(...), math.
-    $FUNC(...), ...) are Python syntax specifically, so this only runs for
-    language == "python" -- a real per-language intent-pattern table is
-    future work, not a silent guess against the wrong grammar."""
+    """Runs each request-relevant semgrep pattern against just this
+    candidate's own source and counts matches. 0 if the request names no
+    known intent, or semgrep can't confirm it -- only adds a signal, never
+    removes one. Patterns are Python-specific, so this only runs for
+    language == "python"."""
     if language != "python":
         return 0
     patterns = _patterns_for_request(request)

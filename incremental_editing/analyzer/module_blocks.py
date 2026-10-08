@@ -1,24 +1,14 @@
-"""LLM-free locator for MODULE-LEVEL content in a language that DOES have
-a function/class concept -- content Delta IR structurally can't reach at
-all (REPLACE/INSERT/DELETE only ever target a function or class symbol),
-because it sits *between*, *before*, or *after* every real symbol: a
-module-level constant or config list, a bare statement, an
-`if __name__ == "__main__":` guard, a standalone comment.
+"""LLM-free locator for module-level content in a language that has a
+function/class concept -- content Delta IR structurally can't reach
+(REPLACE/INSERT/DELETE only target a function/class symbol): a
+module-level constant, a bare statement, an `if __name__ == "__main__":`
+guard, a standalone comment between/around real symbols.
 
-Real gap this closes: before this existed, a request touching only this
-kind of content had no narrower path at all -- the model's own
-escalate:{"kind":"whole_file"} was the only way to express it, and that
-path is refused for edits by policy (run_pipeline.py's
-_run_whole_file_edit). Confirmed live: "remove gpt" against a file whose
-only "gpt" text lives inside a module-level `MODEL_SLOTS = [...]` list
-(never inside any function/class body) found zero symbol candidates,
-saw zero bodies, and correctly escalated -- with nothing narrower to
-fall back to before this module existed.
-
-Closes it the same way analyzer/text_blocks.py already closes the
-equivalent gap for languages with NO symbol concept at all: locate the
-one relevant region, send only that as input and expected output,
-splice it back by line range -- never the whole file.
+Before this existed, such a request had only the refused whole_file
+escalation path (run_pipeline.py's _run_whole_file_edit). Closes the gap
+the same way analyzer/text_blocks.py does for languages with no symbol
+concept at all: locate the one relevant region, send only that, splice it
+back by line range.
 """
 
 from typing import List, Optional
@@ -31,10 +21,9 @@ from .text_blocks import _blocks_from_blank_lines, _safe_vector_rank
 
 
 def _chunk_gap(lines: List[str], start: int, end: int) -> List[SymbolInfo]:
-    """Splits one gap's own lines into blank-line-separated blocks (the
-    same universal technique text_blocks.py already uses for a whole
-    file), re-based from that slice's own 1-indexed positions back onto
-    the real file's absolute line numbers."""
+    """Splits one gap into blank-line-separated blocks (same technique
+    text_blocks.py uses file-wide), rebased onto the real file's absolute
+    line numbers."""
     gap_lines = lines[start - 1 : end]
     offset = start - 1
     return [
@@ -51,13 +40,10 @@ def _chunk_gap(lines: List[str], start: int, end: int) -> List[SymbolInfo]:
 
 
 def index_module_level_blocks(source: str, language: str) -> List[SymbolInfo]:
-    """Every contiguous region of real (non-blank) lines NOT covered by
-    any function/class's own span -- the module-level preamble, gaps
-    between symbols, and any trailing content after the last one. Each
-    gap is itself chunked into blank-line-separated paragraphs, since a
-    single gap can hold several unrelated module-level statements (an
-    import block, a constant, a `__main__` guard) that should stay
-    independently targetable, not one giant region."""
+    """Every contiguous non-blank region not covered by a function/class
+    span -- preamble, gaps between symbols, trailing content. Each gap is
+    chunked into blank-line-separated blocks since one gap can hold
+    several independently-targetable statements."""
     lines = source.splitlines()
     if not lines:
         return []
@@ -100,24 +86,14 @@ def _to_repo_symbols(blocks: List[SymbolInfo], source: str) -> List[RepoSymbol]:
 def locate_module_level_block(
     source: str, user_request: str, language: str, use_hybrid: bool = False
 ) -> Optional[SymbolInfo]:
-    """The single best-matching module-level block for a request, or
-    None when nothing scores confidently (including a tie) -- an
-    ambiguous match must fall through to the existing (refused)
-    whole-file path rather than guessing which region was meant, same
-    "refuse over guess" rule every other locator in this project already
-    holds itself to.
+    """Best-matching module-level block for a request, or None on no
+    confident match (including a tie) -- an ambiguous match falls through
+    to the refused whole-file path rather than guessing.
 
-    Scored by body-content word overlap (the block has no name worth
-    matching against the way a markdown heading does -- just its own
-    first line, truncated) -- the same technique
-    analyzer.locator.locate_candidates_by_body already uses for a
-    request word that only appears inside a symbol's body, applied here
-    to content that isn't inside any symbol's body at all.
-
-    `use_hybrid=True` fuses that word-overlap ranking with BM25 (and
-    vector retrieval, if it's available) over every module-level block
-    in the file -- same reasoning text_blocks.py's own hybrid mode
-    already applies."""
+    Scored by body word overlap (same technique as
+    analyzer.locator.locate_candidates_by_body). `use_hybrid=True` fuses
+    that with BM25 (and vector retrieval, if available) over every
+    module-level block, same as text_blocks.py's hybrid mode."""
     blocks = index_module_level_blocks(source, language)
     if not blocks:
         return None

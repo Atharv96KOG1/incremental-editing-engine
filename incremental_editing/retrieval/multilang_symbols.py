@@ -1,17 +1,12 @@
 """Multi-language symbol + call extraction via Tree-sitter -- extends the
 Python-`ast`-only extraction in `repo_index.py`/`dependency_graph.py` to any
-language `tree-sitter-language-pack` supports, same tool that already made
-`validation/syntax.py` multi-language.
+language `tree-sitter-language-pack` supports.
 
-Node type names differ per grammar (Java's method_declaration vs Go's
-function_declaration vs JS's method_definition, Python's own function_
-definition, ...), so instead of one hand-written query per language, a
-symbol is recognized generically: any node whose type name contains
-"function"/"method" is function-like, one containing "class"/"struct"/
-"interface" is class-like. Verified empirically against Java, JavaScript,
-and Go grammars. Deliberate tradeoff: broad coverage, no per-language
-maintenance, at the cost of missing constructs this substring match
-doesn't catch (Rust's impl_item, C++ operator overloads, ...).
+Node type names differ per grammar, so a symbol is recognized generically:
+any node type containing "function"/"method" is function-like, "class"/
+"struct"/"interface" is class-like. Deliberate tradeoff: broad coverage, no
+per-language maintenance, at the cost of missing some constructs (Rust's
+impl_item, C++ operator overloads, ...).
 """
 
 from dataclasses import dataclass
@@ -49,24 +44,14 @@ _symbol_concept_cache: dict = {}
 
 
 def language_has_symbol_concept(language: str) -> bool:
-    """True if this language's own tree-sitter grammar defines ANY node
-    kind _classify() would recognize as function/class-shaped -- a real,
-    verifiable structural fact about the FORMAT (python: yes, even for
-    an empty file, since "add a new function" is still a valid INSERT;
-    markdown/json/yaml/csv/html/css/ini/dotenv: no, full stop, regardless
-    of what any request asks for) -- not a guess about one specific
-    file's current content, and not a hardcoded per-language list
-    (checked directly against the grammar's own node kinds instead, so
-    it stays correct for every language tree-sitter-language-pack
-    supports without maintaining one).
+    """True if this language's grammar defines any node kind _classify()
+    recognizes as function/class-shaped -- checked against the grammar's
+    own node kinds, not a hardcoded per-language list, so it's correct for
+    any language tree-sitter-language-pack supports.
 
-    Real waste this exists to let a caller avoid: STRUCTURED_EDIT's
-    classification call (its whole premise is "REPLACE/INSERT/DELETE on
-    a function/class, or escalate") can only ever answer "escalate" for
-    a language with no such concept at all -- every single time -- so a
-    real request to add one line to a 30-line README paid a full
-    classification call (~1045 tokens for the system prompt alone)
-    before ever reaching the generation call that could actually help."""
+    Lets a caller (e.g. STRUCTURED_EDIT's classifier, which can only ever
+    answer "escalate" for a language with no such concept) skip a wasted
+    classification call for languages like markdown/json/yaml/css."""
     if language not in _symbol_concept_cache:
         try:
             lang_obj = get_parser(language).language
@@ -79,20 +64,13 @@ def language_has_symbol_concept(language: str) -> bool:
 
 
 def _find_name_node(node):
-    """Fallback for a grammar that doesn't expose its identifier as a
-    direct "name" field -- C/C++'s function_definition is the real case
-    this closes: the identifier is nested inside its own function_declarator
-    child, two levels down, with no "name" field on function_definition
-    itself at all, so child_by_field_name("name") always returned None and
-    the symbol was silently dropped, every time, for every C/C++ function.
+    """Fallback for a grammar without a direct "name" field -- e.g. C/C++'s
+    function_definition nests its identifier inside a function_declarator
+    child, so child_by_field_name("name") always returns None.
 
-    Pre-order DFS for the first descendant whose type ends in
-    "identifier" (covers identifier/type_identifier/field_identifier/...
-    across every grammar checked) -- general, not per-language, and safe
-    because a definition's own name always appears in source order before
-    its parameter list and body (verified for C/C++: the declarator's
-    identifier is walked before its own parameter_list, and the whole
-    declarator before the function's body)."""
+    Pre-order DFS for the first descendant whose type ends in "identifier".
+    Safe because a definition's name always appears in source order before
+    its parameter list and body."""
     for child in node.children:
         if child.type.endswith("identifier"):
             return child
@@ -131,9 +109,8 @@ def extract_symbols(source: str, language: str) -> List[RawSymbol]:
 
 def extract_called_names(source: str, language: str) -> List[str]:
     """Every callee name referenced in source, name-based only -- same
-    no-cross-module-resolution approach `dependency_graph.py` already uses
-    for Python, extended to any language via the same generic node-type
-    match ("call"/"invocation" in the node type)."""
+    no-cross-module-resolution approach as `dependency_graph.py` for
+    Python, via a generic node-type match ("call"/"invocation")."""
     parser = get_parser(language)
     tree = parser.parse(source.encode("utf-8"))
     names: List[str] = []
@@ -156,14 +133,11 @@ def extract_called_names(source: str, language: str) -> List[str]:
 
 
 def extract_import_lines(source: str, language: str) -> List[Tuple[int, int]]:
-    """(start_line, end_line) 1-indexed inclusive ranges for every top-level
-    import statement -- import statements are always direct children of
-    the file's root node in every grammar checked (Java/JS/Go), so unlike
-    symbols/calls this doesn't need a whole-tree walk: only root-level
-    children are considered, which also keeps a language's nested
-    per-import child nodes (e.g. Java's leaf "import" token, Go's
-    import_spec entries inside one grouped import_declaration) from being
-    picked up as separate, overlapping ranges."""
+    """(start_line, end_line) 1-indexed ranges for top-level import
+    statements. Only root-level children are considered -- imports are
+    always direct root children in every grammar checked, which also
+    avoids double-counting a language's nested per-import child nodes
+    (e.g. Go's grouped import_declaration)."""
     parser = get_parser(language)
     tree = parser.parse(source.encode("utf-8"))
     return [

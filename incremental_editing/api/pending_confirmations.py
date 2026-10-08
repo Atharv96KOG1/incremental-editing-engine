@@ -1,23 +1,14 @@
-"""Shared store for edit/create runs paused right before COMMIT by
-`require_confirmation=True` -- the human-in-the-loop accept/reject gate
-the web UI uses (the CLI never sets this flag, so its behavior is
-unchanged: always auto-commits, exactly as before this existed).
+"""Shared store for edit/create runs paused before COMMIT when
+`require_confirmation=True` (the web UI's accept/reject gate; the CLI
+never sets this flag and always auto-commits, unaffected). No files are
+written until `resolve()` accepts, so "reject" is just dropping the
+pending state -- nothing to undo.
 
-By the time a run reaches this gate, APPLY (or GENERATE for create) and
-TEST have already run and succeeded -- none of the files below have been
-written yet (that only ever happens in `resolve()` below, or in the
-original auto-commit path when `require_confirmation` is False). So
-"reject" is just forgetting the pending state; nothing to undo.
-
-An in-memory dict by default -- fine for one long-lived `iee serve`
-process, same POC-scope tradeoff `local_storage_dir` already makes
-elsewhere (see storage/minio_client.py), but lost on restart and
-invisible to any second worker process. Set `REDIS_URL` in `.env` to
-back this with Redis instead -- same "endpoint set -> use it" switch
-MinIO already uses, zero code change for either caller (`stash`/
-`resolve` are the only two operations either backend needs: one write,
-one read-and-delete), with a TTL (`pending_confirmation_ttl_seconds`,
-default 24h) so an abandoned run doesn't linger forever."""
+In-memory dict by default (fine for one `iee serve` process, lost on
+restart). Set `REDIS_URL` to back it with Redis instead, same
+endpoint-set-so-use-it switch as storage/minio_client.py; TTL is
+`pending_confirmation_ttl_seconds` (default 24h) so an abandoned run
+doesn't linger forever."""
 
 import json
 from pathlib import Path
@@ -47,24 +38,14 @@ def _redis_key(run_id: str) -> str:
 
 
 def stash(run_id: str, kind: str, **fields) -> None:
-    """kind is "edit" (STRUCTURED_EDIT, has a delta_dict), "create",
-    "whole_file_edit", "language_conversion", "create_files" (all but
-    "edit" are FULL_REGENERATION, no delta_dict), or "delete_file" (no
-    LLM call at all -- see run_pipeline._run_whole_file_delete) --
-    resolve only ever needs to know whether it's the delta-based one,
-    the deletion one, or neither.
-
-    `fields` must include `files: Dict[relative_path, new_content]` for
-    every kind except "delete_file", which instead carries
-    `deleted_files: List[relative_path]` -- one entry for a normal
-    single-file edit/create, N entries for a multi-file create ("make a
-    new code file of frontend and backend") or a create-then-link
-    request (a new .env plus an edit to the file that now loads it) --
-    all committed and confirmed together, as one atomic accept/reject
-    over every file this run touches. "create_files" may also carry
-    `folders: List[relative_path]` -- bare directories with no content
-    (e.g. a plain "make a folder called frontend" request), mkdir'd on
-    accept alongside whatever real files this run also touches."""
+    """`kind` is "edit" (STRUCTURED_EDIT, has a delta_dict), or one of the
+    FULL_REGENERATION kinds ("create", "whole_file_edit",
+    "language_conversion", "create_files"), or "delete_file" (no LLM
+    call). `fields` must include `files: Dict[relative_path, new_content]`
+    for every kind except "delete_file", which instead carries
+    `deleted_files: List[relative_path]`. "create_files" may also carry
+    `folders: List[relative_path]` for bare directories with no content,
+    mkdir'd on accept alongside any real files."""
     payload = {"kind": kind, **fields}
     settings = get_settings()
     if settings.redis_url:

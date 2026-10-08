@@ -1,11 +1,6 @@
-"""Vector/semantic retrieval over the repo-wide symbol index (PHOENIX doc
-section 4: "Vector retrieval is strong for semantic intent").
-
-Embeddings come from the same Bifrost gateway already used for GPT-5.4 --
-no local embedding model, no vector database. Cosine similarity against
-an in-memory numpy array is plenty for a single-repo index; this is
-explicitly not built to scale to a multi-million-symbol corpus.
-"""
+"""Vector/semantic retrieval over the repo-wide symbol index. Embeddings via the
+Bifrost gateway; cosine similarity over an in-memory numpy array, not built to
+scale past a single-repo index."""
 
 import hashlib
 from typing import List

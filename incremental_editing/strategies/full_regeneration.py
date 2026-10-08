@@ -1,14 +1,6 @@
-"""FULL_REGENERATION strategy (doc section 10, Approach A).
-
-Used three places: as the baseline to compare incremental editing
-against; the only way to get code into a file that doesn't exist yet, to
-bootstrap a brand-new file from a prompt before any incremental edit has
-something to work against; and as the fallback for an existing file when
-the request is file-wide (comments, whitespace, docstrings, formatting --
-see analyzer/locator.is_whole_file_request) rather than a change to one
-named symbol, since that reaches content STRUCTURED_EDIT's per-symbol
-Delta IR can't touch.
-"""
+"""FULL_REGENERATION strategy: baseline for comparison, bootstraps new files,
+and fallback for file-wide requests STRUCTURED_EDIT's per-symbol Delta IR
+can't touch."""
 
 import re
 import time

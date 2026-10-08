@@ -1,12 +1,10 @@
-"""Local web frontend: a React, ChatGPT-styled chat page (source in
-../frontend, built to ../frontend/dist) that submits a change request and
+"""Local web frontend (React UI in ../frontend, built to ../frontend/dist):
 streams the same tagged pipeline checklist as the `iee` CLI (LOCALIZE ->
-GENERATE -> VALIDATE -> APPLY -> TEST -> COMMIT), via Server-Sent Events,
-then renders the same summary the CLI prints as a card.
+GENERATE -> VALIDATE -> APPLY -> TEST -> COMMIT) via Server-Sent Events.
 
 `run_edit`/`run_create` are synchronous, so each request runs in a
-background thread that pushes (tag, msg) step events onto a queue; the
-async SSE generator just drains that queue without blocking the event loop.
+background thread pushing (tag, msg) step events onto a queue; the async
+SSE generator drains that queue without blocking the event loop.
 """
 
 import asyncio
@@ -104,6 +102,7 @@ class RunRequest(BaseModel):
     confirm_symbol: Optional[str] = None
     confirm_symbol_type: Optional[str] = None
     confirm_symbol_line: Optional[int] = None
+    confirm_symbols: Optional[list] = None
     use_joern: str = "off"
     require_confirmation: bool = True
     use_hybrid_retrieval: bool = True
@@ -127,9 +126,8 @@ class ChatHistoryRequest(BaseModel):
 
 @app.get("/api/chat_history")
 def get_chat_history(project_dir: str, project_id: Optional[str] = None) -> dict:
-    """Simple resume, not a multi-session browser: one continuous log per
-    project, so reopening the app (or refreshing) picks the conversation
-    back up where it left off instead of starting blank every time."""
+    """One continuous chat log per project, so reopening/refreshing resumes
+    where it left off instead of starting blank."""
     storage = get_storage()
     key = f"projects/{_project_id_for(project_dir, project_id)}/chat_history.json"
     if storage.exists(key):
@@ -277,6 +275,7 @@ async def run(req: RunRequest) -> StreamingResponse:
                     confirm_symbol=req.confirm_symbol,
                     confirm_symbol_type=req.confirm_symbol_type,
                     confirm_symbol_line=req.confirm_symbol_line,
+                    confirm_symbols=req.confirm_symbols,
                     require_confirmation=req.require_confirmation,
                     use_hybrid_retrieval=req.use_hybrid_retrieval,
                     use_joern=req.use_joern,
@@ -309,10 +308,9 @@ async def run(req: RunRequest) -> StreamingResponse:
 
 @app.post("/api/confirm")
 def confirm(req: ConfirmRequest) -> dict:
-    """Resolves a run paused by RunRequest.require_confirmation -- accept
-    commits (writes the file, creates the version), reject discards it.
-    Non-streaming: by this point tests already passed, so all that's left
-    is a version write and a file write, both fast."""
+    """Resolves a run paused by require_confirmation: accept commits (file +
+    version write), reject discards. Non-streaming -- tests already passed,
+    so what's left is fast."""
     try:
         return pending_confirmations.resolve(req.run_id, req.accept)
     except KeyError as e:

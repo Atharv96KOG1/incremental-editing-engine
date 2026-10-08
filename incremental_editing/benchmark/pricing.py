@@ -1,21 +1,9 @@
-"""Per-1K-token pricing for cost metrics.
-
-Defaults below come from the Bifrost gateway's /v1/models pricing field for
-openai/gpt-5.4 (prompt $0.0000025, completion $0.000015 per token). Override
-via LLM_PRICING_JSON in .env for other models/gateways, e.g.
-LLM_PRICING_JSON='{"openai/gpt-5.4": [0.0025, 0.015, 0.00025]}' (the third,
-optional value is the cached-input rate -- see below).
-
-Cached-input pricing: verified live against the real gateway (see
-structured_edit.py's `_call_llm`) that an identical system+context prefix
-across two calls -- exactly what every bounded self-repair retry sends,
-since only the failure-specific suffix changes -- gets served largely
-from cache on the second call (measured: ~85% of prompt tokens on one
-real test). OpenAI's published cached-input rate for gpt-5.4 specifically
-is $0.25/1M vs $2.50/1M uncached, a 90% discount -- verified current as
-of this writing, not assumed from an older, less specific model's rate.
-Charging every repair attempt as if its whole resent prefix were freshly
-computed overstates real cost, sometimes substantially.
+"""Per-1K-token pricing for cost metrics. Defaults are gpt-5.4's Bifrost gateway
+rates; override via LLM_PRICING_JSON in .env, e.g.
+LLM_PRICING_JSON='{"openai/gpt-5.4": [0.0025, 0.015, 0.00025]}' (third value is
+the optional cached-input rate). Cached-input rate matters because repeated
+system+context prefixes (e.g. self-repair retries) get served largely from
+cache at a 90% discount -- charging full price would overstate real cost.
 """
 
 import json

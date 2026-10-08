@@ -1,12 +1,6 @@
-"""MODULE_BLOCK_EDIT strategy: regenerate exactly one located module-level
-region (see analyzer/module_blocks.py) instead of the whole file, for
-content that sits outside every function/class's own span in a language
-that otherwise has a real symbol concept.
-
-Same generation mechanics strategies/text_block_edit.py already uses
-(reused directly, not duplicated) -- just given one module-level region
-instead of a whole-file-format section as both input and expected output
-shape.
+"""MODULE_BLOCK_EDIT strategy: regenerate one located module-level region
+(content outside any function/class span) instead of the whole file. Reuses
+full_regeneration's own call mechanics, just scoped to one region.
 """
 
 from typing import Optional

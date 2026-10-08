@@ -1,10 +1,8 @@
-"""Cheap, local change localization: which symbol(s) in a file does a
-request likely target -- no LLM call, pure heuristic matching against
-symbol names and docstrings (doc sections 12/13).
+"""Local change localization: which symbol(s) a request likely targets --
+no LLM call, heuristic matching against symbol names/docstrings.
 
-Deliberately simple for phase 4: falls back to "no confident match" rather
-than guessing, so the context builder can fall back to the whole file
-instead of silently dropping context the model actually needs.
+Falls back to "no confident match" rather than guessing, so the context
+builder falls back to the whole file instead of dropping needed context.
 """
 
 import ast
@@ -19,11 +17,9 @@ from ..retrieval.multilang_symbols import extract_called_names, extract_symbols
 
 
 class AmbiguousSymbolError(Exception):
-    """The file defines the same top-level name more than once. Python only
-    keeps the last definition at runtime, so silently picking one match
-    (as a plain first-hit search would) risks editing dead, shadowed code
-    while the live definition stays untouched. Callers should refuse and
-    surface this rather than guess."""
+    """Name defined more than once. Picking one match blind risks editing
+    dead/shadowed code instead of the live definition -- callers must
+    refuse, not guess."""
 
 
 @dataclass
@@ -38,12 +34,9 @@ class SymbolInfo:
 
 
 def _index_python_symbols(tree: ast.AST) -> List[SymbolInfo]:
-    """Recursive (not ast.walk's flat BFS) so each symbol can be tagged
-    with its nearest enclosing class -- needed so two methods that
-    legitimately share a bare name in different classes (completely
-    normal Python, not a bug) can eventually be told apart, instead of
-    only ever being addressable by a name that's ambiguous the moment a
-    file has more than one class."""
+    """Recursive (not ast.walk's flat BFS) so each symbol carries its
+    enclosing class -- needed to disambiguate same-named methods across
+    different classes."""
     symbols: List[SymbolInfo] = []
 
     def walk(node: ast.AST, parent_class: Optional[str]) -> None:
@@ -65,17 +58,11 @@ def _index_python_symbols(tree: ast.AST) -> List[SymbolInfo]:
 
 
 def index_symbols(source: str, language: str = "python") -> List[SymbolInfo]:
-    """`language` selects how source gets parsed: "python" uses the
-    ast-based path below (docstrings, decorator-aware start lines, class
-    scope -- more precise than the generic path, so kept as its own
-    branch rather than folded into Tree-sitter too). Any other
-    Tree-sitter language name goes through `multilang_symbols.
-    extract_symbols` instead -- no docstring or class-scope tracking
-    there (no single cross-language convention for either), so
-    `docstring_first_line`/`parent_class` are always None for those. An
-    unrecognized/unparseable language returns [] rather than guessing at
-    Python syntax (the earlier bug this fixes: a .java file's `public
-    class Foo {` isn't valid Python and used to raise SyntaxError here)."""
+    """Python uses the ast-based path (docstrings, decorator-aware start
+    lines, class scope); any other Tree-sitter language goes through
+    multilang_symbols.extract_symbols instead, with docstring_first_line/
+    parent_class always None. Unrecognized/unparseable language returns []
+    rather than mis-parsing as Python."""
     if language == "python":
         return _index_python_symbols(ast.parse(source))
 
@@ -91,26 +78,11 @@ def index_symbols(source: str, language: str = "python") -> List[SymbolInfo]:
 
 
 def looks_like_python(source: str) -> bool:
-    """A real failure this catches: a file literally named "new.db",
-    containing a genuine Python script (`def create_database(): ...
-    cur.executescript(...)`) that builds a SQLite database -- naming the
-    *setup script* after the database it creates, a real, observed
-    naming choice. detect_language() is extension-only, so a ".db"
-    extension always comes back as language=None regardless of content,
-    losing all symbol extraction: REPLACE on a real function inside it
-    then fails with "not found" (index_symbols(source, None) == []), and
-    LOCALIZE is forced to send the whole file instead of the one
-    relevant function. A real ast.parse() success is a much stronger
-    signal than a mismatched filename extension.
-
-    Deliberately stricter than a bare ast.parse() check: parsing alone
-    isn't enough -- a CSV's rows ("id,name,salary") are *also*
-    syntactically valid Python (each line parses as a harmless, unused
-    tuple expression), which would misdetect every plain CSV as Python
-    and silently break the whole-file fallback that already handles CSV
-    correctly. Requiring at least one real function/class/import --
-    something an actual Python file almost always has and mere tabular
-    data never does -- is what tells the two apart."""
+    """Stricter than a bare ast.parse() check: requires at least one real
+    function/class/import, not just parse success. Catches real Python
+    files with misleading extensions (detect_language() is extension-only)
+    while not misdetecting plain CSV/tabular data as Python (each row also
+    parses as a valid tuple expression)."""
     try:
         tree = ast.parse(source)
     except SyntaxError:
@@ -122,16 +94,12 @@ def looks_like_python(source: str) -> bool:
 
 
 def _is_trivial_delegate(source: str, wrapper: "SymbolInfo", impl: "SymbolInfo") -> bool:
-    """True when `wrapper` (a module-level function) is nothing but a
-    one-line facade calling `impl` (the same name, but a method on some
-    class) -- e.g. `def divide(a, b): return Calculator.divide(a, b)`.
-    Detected structurally (tiny body, a call expression referencing
-    impl's own class + the shared name) -- never by a specific name,
-    file, or class. Real pattern this exists for: a broad "use OOP" /
-    "wrap this in a class" refactor introduces a class while keeping
-    every old flat function as a backward-compatible shim, so nothing
-    already importing the flat API breaks. Editing "divide" from then on
-    should mean the real implementation, not its forwarding shim."""
+    """True when `wrapper` (module-level function) is just a one-line
+    facade calling `impl` (same name, method on a class), e.g.
+    `def divide(a, b): return Calculator.divide(a, b)`. Detected
+    structurally (tiny body + call referencing impl's class+name),
+    covering OOP-refactor shims kept for backward compat -- editing the
+    name should hit the real implementation, not the shim."""
     if impl.parent_class is None or wrapper.parent_class is not None:
         return False
     lines = source.splitlines()
@@ -150,33 +118,15 @@ def find_symbol(
     source: Optional[str] = None,
     allow_delegate_resolution: bool = True,
 ) -> Optional[SymbolInfo]:
-    """The single symbol matching (symbol_type, symbol_name), or None if
-    there's no match. Raises AmbiguousSymbolError if the name is defined
-    more than once (Python only keeps the last definition at module
-    scope, and even where that's not the concern -- e.g. the same method
-    name in two different classes -- a bare name alone can't say which
-    one is meant) UNLESS:
-    - `prefer_line` is given and matches exactly one of the candidates'
-      start_line: the ambiguity was already resolved earlier
-      (locate_candidates picked a specific occurrence before the LLM was
-      ever called), so re-raising here would refuse an edit whose target
-      was never actually in doubt; or
-    - `source` is given, `allow_delegate_resolution` is True, and the two
-      matches are a class method plus a trivial module-level delegate to
-      it (_is_trivial_delegate) -- then the class method (the real
-      implementation) is returned, since a one-line forwarding shim has
-      no independent logic an edit could mean instead. Only ever applies
-      to exactly 2 matches in exactly this shape; 3+ matches, or 2 that
-      aren't a delegate pair, still raise -- this is a narrow, structural
-      exception, not a general "just pick one" fallback.
+    """Single symbol matching (symbol_type, symbol_name), or None. Raises
+    AmbiguousSymbolError on multiple matches, unless `prefer_line` pins one
+    occurrence already resolved earlier, or the two matches are a class
+    method + its trivial module-level delegate (_is_trivial_delegate) --
+    then the real method wins.
 
-    `allow_delegate_resolution` defaults True for REPLACE/INSERT-anchor
-    resolution (editing the real implementation behind a shim is safe
-    and almost always what's meant) but callers resolving a DELETE
-    target should pass False: silently deleting just the implementation
-    would leave its wrapper calling a method that no longer exists --
-    a real regression the auto-resolution that's safe everywhere else
-    would introduce here, so DELETE keeps asking instead of guessing."""
+    `allow_delegate_resolution` should be False for DELETE: auto-resolving
+    to the implementation there would leave the shim calling a now-missing
+    method, so DELETE must ask instead of guessing."""
     matches = [s for s in symbols if s.symbol_type == symbol_type and s.name == symbol_name]
     if len(matches) > 1:
         if prefer_line is not None:
@@ -200,18 +150,11 @@ _DEFINED_NAME_WRAPPER_CLASS = "__IEEWrapper__"
 
 
 def defined_symbol_name(content: Optional[str], language: str = "python") -> Optional[str]:
-    """The name of the single function/class `content` actually defines,
-    or None if it's empty, unparseable, or doesn't define exactly one.
-    The model's declared symbol_name/target is advisory only -- this is
-    the only source of truth for what a snippet of generated code really
-    creates, used both to correct a mismatched *displayed* INSERT name
-    (api/run_pipeline.py) and, more importantly, to catch an INSERT that
-    would create a *second* definition of a name that already exists
-    elsewhere in the file (validate_targets below) -- the exact class of
-    real corruption this project has hit: a class-method version of a
-    function inserted alongside an old top-level one that was never
-    removed, both now silently coexisting until something tries to
-    REPLACE/DELETE the name and hits an unresolvable AmbiguousSymbolError."""
+    """Name of the single function/class `content` actually defines, or
+    None if empty/unparseable/not exactly one. The model's declared
+    symbol_name is advisory only -- this is ground truth, used to correct
+    a mismatched INSERT name and to catch an INSERT that would create a
+    duplicate definition of an existing name."""
     if not content:
         return None
     if language == "python":
@@ -260,21 +203,34 @@ def _words(text: str) -> set:
     return set(_WORD_RE.findall(text.lower())) - _STOPWORDS
 
 
-def _local_called_by_counts(source: str, symbols: List[SymbolInfo], language: str) -> Dict[str, int]:
-    """How many *other* symbols in this same file call each symbol, by
-    name -- a free signal (zero LLM/embeddings calls) computed from the
-    same call-extraction primitives dependency_graph.py/multilang_
-    symbols.py already use repo-wide, just scoped to one file's own
-    symbols. Used as a tiebreak that costs nothing before ever reaching
-    for the paid semantic tiebreak below -- a symbol real code in this
-    file actually calls is a stronger, free signal than an arbitrary
-    pick, and most ties never need to pay for embeddings at all once
-    this is checked first."""
+def _local_called_by_counts(
+    source: str, symbols: List[SymbolInfo], language: str
+) -> Dict[Tuple[str, int], int]:
+    """How many other symbols in this file call each symbol -- a free (no
+    LLM/embeddings) tiebreak signal checked before the paid semantic
+    tiebreak below. Keyed by (name, start_line), not bare name: two
+    methods sharing a name across different classes (e.g. Trig.cos vs
+    Hyperbolic.cos) must be counted separately, or the tiebreak this
+    exists for can never actually distinguish them. A caller inside a
+    class crediting a same-named callee prefers that class's own
+    occurrence (self.cos() means this class's cos) over a same-named
+    method elsewhere; a module-level caller or one with no same-class
+    match credits every occurrence, same as before.
+
+    Class-container symbols are skipped as callers: index_symbols gives a
+    class's own span every one of its methods' lines, so treating it as a
+    caller would double-count each method's calls as a second, phantom
+    caller distinct from the method itself."""
     lines = source.splitlines()
-    known_names = {s.name for s in symbols}
-    called_by: Dict[str, set] = {name: set() for name in known_names}
+    by_name: Dict[str, List[SymbolInfo]] = {}
+    for s in symbols:
+        by_name.setdefault(s.name, []).append(s)
+    known_names = set(by_name)
+    called_by: Dict[Tuple[str, int], set] = {(s.name, s.start_line): set() for s in symbols}
 
     for sym in symbols:
+        if sym.symbol_type == "class":
+            continue
         snippet = "\n".join(lines[sym.start_line - 1 : sym.end_line])
         try:
             if language == "python":
@@ -284,26 +240,22 @@ def _local_called_by_counts(source: str, symbols: List[SymbolInfo], language: st
         except Exception:
             continue
         for callee in set(callees):
-            if callee in known_names and callee != sym.name:
-                called_by[callee].add(sym.name)
+            if callee not in known_names or callee == sym.name:
+                continue
+            occurrences = by_name[callee]
+            same_class = [o for o in occurrences if o.parent_class == sym.parent_class]
+            for target in same_class or occurrences:
+                called_by[(target.name, target.start_line)].add((sym.name, sym.start_line))
 
-    return {name: len(callers) for name, callers in called_by.items()}
+    return {key: len(callers) for key, callers in called_by.items()}
 
 
 def _semantic_tiebreak(source: str, user_request: str, tied: List[SymbolInfo]) -> SymbolInfo:
-    """Breaks a genuine score tie (two or more symbols equally strong by
-    every text heuristic -- the common shape in a large, class-heavy file:
-    the same method name repeated across classes, e.g. Trig.tan and
-    Hyperbolic.tan, with near-identical bodies and no literal name in the
-    request to prefer one) using real semantic similarity instead of an
-    arbitrary pick. The enclosing class name is prefixed onto each
-    candidate's own body text specifically because near-duplicate method
-    bodies otherwise carry almost no differentiating signal on their own
-    -- the class each belongs to is usually what the request is actually
-    about. Lazy import: this is the only place in this module that ever
-    calls an embeddings API, and only when heuristics alone can't decide;
-    any failure (offline, gateway down) falls back to the first tied
-    candidate rather than failing the whole request over a tiebreak."""
+    """Breaks a genuine score tie (e.g. same method name repeated across
+    classes, near-identical bodies) via embedding similarity, with class
+    name prefixed onto each body for signal. Lazy import: the only
+    embeddings call in this module; any failure falls back to the first
+    tied candidate."""
     try:
         from ..retrieval.vector_retriever import _embed
     except Exception:
@@ -364,7 +316,7 @@ def locate_candidates(
     for score, sym in scored:
         by_name.setdefault(sym.name, []).append((score, sym))
 
-    local_called_by: Optional[Dict[str, int]] = None
+    local_called_by: Optional[Dict[Tuple[str, int], int]] = None
     collapsed: List[Tuple[int, SymbolInfo]] = []
     for group in by_name.values():
         if len(group) == 1:
@@ -377,9 +329,13 @@ def locate_candidates(
         else:
             if local_called_by is None:
                 local_called_by = _local_called_by_counts(source, symbols, language)
-            by_callers = sorted({local_called_by.get(s.name, 0) for s in tied}, reverse=True)
+            by_callers = sorted({local_called_by.get((s.name, s.start_line), 0) for s in tied}, reverse=True)
             top_callers = by_callers[0]
-            free_winners = [s for s in tied if local_called_by.get(s.name, 0) == top_callers] if top_callers > 0 else tied
+            free_winners = (
+                [s for s in tied if local_called_by.get((s.name, s.start_line), 0) == top_callers]
+                if top_callers > 0
+                else tied
+            )
             winner = free_winners[0] if len(free_winners) == 1 else _semantic_tiebreak(source, user_request, tied)
         collapsed.append((top_score, winner))
 
@@ -390,34 +346,17 @@ def locate_candidates(
 def locate_candidates_by_body(
     source: str, user_request: str, language: str = "python", max_candidates: int = 3
 ) -> List[SymbolInfo]:
-    """Fallback localization for when locate_candidates finds nothing at
-    all -- searches each symbol's own BODY text for a real content word
-    from the request, instead of just its name/docstring.
+    """Fallback for when locate_candidates finds nothing: searches each
+    symbol's BODY text for a request word, not just name/docstring --
+    catches targets that only appear inside a function (e.g. a dict
+    literal), which name-only matching misses entirely.
 
-    Real waste this closes: "remove the minio" meant deleting a
-    `"minio": {...}` dict literal *inside* chatbot.py's `health()`
-    function -- "minio" never appears in any symbol's name or docstring,
-    only in that one function's body, so name-only matching found
-    nothing and the request fell all the way through to a full-file
-    regeneration (a ~$0.01, several-second round trip) just so the model
-    could see where "minio" actually was. A file can be arbitrarily
-    large while the part actually relevant to a request stays a handful
-    of lines -- this project's whole premise is sending that handful,
-    not the whole thing, whenever it's findable at all.
-
-    Deliberately conservative: only whole-word matches (not
-    find_delete_candidates' broad substring, since this feeds normal
-    REPLACE/INSERT context selection, not an auto-applied delete target)
-    against real, already-parsed content words (stopwords/generic verbs/
-    type words dropped, same filtering as the delete path), ranked by
-    how many distinct target words each body contains and capped to a
-    small number of candidates -- a common word can't drag in half the
-    file's functions the way it could an unranked, uncapped search.
-    Tokenized with `_words()` (splits on any non-alphanumeric run), not
-    a raw `\\bword\\b` regex -- code identifiers are routinely
-    snake_case/SCREAMING_SNAKE_CASE ("MINIO_ENDPOINT"), where `_` isn't
-    a real word boundary to regex's `\\b` but very much is one for how
-    this project already tokenizes everywhere else."""
+    Conservative: whole-word matches only (not find_delete_candidates'
+    broad substring, since this feeds normal REPLACE/INSERT context, not
+    an auto-applied delete), ranked by distinct-word hit count and capped.
+    Uses `_words()` tokenization (splits on non-alphanumeric runs) rather
+    than `\\bword\\b`, since `_` isn't a real boundary for regex but code
+    identifiers (snake_case/SCREAMING_SNAKE_CASE) need it to be."""
     target_words = {w for w in _words(user_request) - _GENERIC_LEADING_VERBS - _GENERIC_TYPE_WORDS if len(w) >= 3}
     if not target_words:
         return []
@@ -453,28 +392,17 @@ def is_delete_intent(user_request: str) -> bool:
 
 
 def is_whole_file_delete_target(file: str, user_request: str) -> bool:
-    """True when a delete/remove request means the file itself, not a
-    symbol inside it -- matched the same structural way find_delete_candidates
-    matches a code-level delete: against the file's own *real* name (its
-    basename and extension-less stem), never a guessed keyword list.
-
+    """True when a delete/remove request means the file itself, matched
+    against the file's real basename/stem (never a guessed keyword list).
     Only called after find_delete_candidates/find_multi_delete_targets
-    already found nothing inside the file, so a real symbol name always
-    wins over this. A bare "delete this file"/"delete the file" (nothing
-    left but the instruction verb and the generic word "file") counts
-    too -- with a single target file already selected there's nothing
-    else it could mean. "delete new.db"/"remove calculator.py" also
-    match, against the real path.
+    found nothing inside the file, so a real symbol name always wins
+    first.
 
-    Deliberately does NOT also drop _GENERIC_LEADING_VERBS/_GENERIC_TYPE_WORDS
-    here the way find_delete_candidates does for symbol matching -- doing
-    so let "delete the add function" (add is a real symbol name that also
-    happens to be a generic imperative verb) leave zero target words and
-    misfire as a whole-file delete, permanently destroying the wrong
-    thing. Every remaining content word must survive and be found in the
-    real filename for this to count -- if it isn't, this returns False
-    and the request safely falls through to the normal (LLM-driven)
-    path instead of guessing."""
+    Deliberately does NOT drop _GENERIC_LEADING_VERBS/_GENERIC_TYPE_WORDS
+    here (unlike find_delete_candidates) -- doing so would let "delete the
+    add function" (a real symbol name that's also a generic verb) misfire
+    as a whole-file delete. Every remaining word must match the filename
+    or this returns False."""
     from pathlib import PurePosixPath
 
     words = user_request.lower().strip().split()
@@ -502,43 +430,22 @@ def target_file_for_conversion(file: str, target_extension: str) -> str:
 
 def find_delete_candidates(source: str, user_request: str, language: str = "python") -> List[SymbolInfo]:
     """Every symbol whose name contains a real target word from a
-    remove/delete request -- deliberately a broad substring search, not
-    the scored/ranked path `locate_candidates` uses for every other edit,
-    because for a DELETE the cost of silently picking wrong is much
-    higher than the cost of asking. Returns [] if the request has no
-    target word left after dropping the instruction verb and generic type
-    nouns (e.g. bare "remove the function"), or if nothing matches.
+    remove/delete request -- deliberately broad substring search (not
+    locate_candidates' scored path), since for DELETE picking wrong
+    silently costs more than asking. Returns [] if no target word
+    survives (verb/generic-type-noun stripped) or nothing matches.
 
-    Words shorter than 3 characters are excluded from the target term --
-    a bare "x" or "on" would substring-match almost any real name in a
-    typical file (max, matrix, box, ...) and turn the picker into a
-    meaningless wall of unrelated chips instead of a real disambiguation.
+    Words under 3 chars excluded (would substring-match almost anything).
+    A name defined multiple times surfaces as one candidate per
+    occurrence (own start_line/end_line), so a confirmed pick can resolve
+    the exact occurrence via find_symbol's prefer_line instead of hitting
+    AmbiguousSymbolError again.
 
-    A name defined more than once now surfaces as one candidate *per
-    occurrence*, not collapsed to one -- each carries its own real
-    start_line/end_line, which the picker already displays and which
-    run_edit now threads through as confirm_symbol_line (find_symbol's
-    prefer_line) so a confirmed delete can resolve the exact occurrence
-    instead of hitting the same "defined N times" AmbiguousSymbolError a
-    bare name confirmation can't get past. (Real failure this replaces:
-    a file with a name genuinely defined 3 times collapsed to one picker
-    chip; picking it and confirming still failed with REFERENCE_ERROR,
-    since the bare name alone is inherently ambiguous no matter how many
-    times it's confirmed.)
-
-    Falls back to a fuzzy (edit-distance) match against real symbol
-    names when the substring search finds nothing at all -- a typo'd
-    target ("remove substract", "delete the squre function") is common
-    enough in practice, and every real name in the file is already fully
-    known right here, so correcting it structurally is strictly better
-    than falling through to a full LLM call: real runs showed exactly
-    this ("remove substract" against a file with a real `subtract`)
-    escalating all the way to a 10+ second, ~$0.03 full-file
-    regeneration just to find a name a spell-check-grade match already
-    could, for free. Still matched against real, already-indexed names
-    only -- never a guessed/hardcoded word list -- and still refuses
-    (via the same multi-candidate picker) rather than silently guessing
-    if more than one real name is a close enough match."""
+    Falls back to fuzzy (edit-distance) matching against real symbol
+    names when substring search finds nothing -- catches typos ("remove
+    substract") cheaply instead of escalating to a full LLM regeneration.
+    Still only matches real indexed names, and still refuses via the
+    picker if more than one fuzzy match is close enough."""
     target_words = {w for w in _words(user_request) - _GENERIC_LEADING_VERBS - _GENERIC_TYPE_WORDS if len(w) >= 3}
     if not target_words:
         return []
@@ -558,23 +465,14 @@ _DELETE_LIST_SEPARATOR_RE = re.compile(r",|\band\b|&|;", re.IGNORECASE)
 
 
 def find_multi_delete_targets(source: str, user_request: str, language: str = "python") -> Optional[List[SymbolInfo]]:
-    """"delete tan, sec and cos" names three distinct, deliberate targets
-    -- not one ambiguous one. find_delete_candidates' broad substring
-    search can't tell the two apart: it matched 10 symbols for that exact
-    request (tan/tanh/atan_inverse/cos/cosin/acos_inverse/acos/sec/
-    asec_inverse/sech), which would present as one confusing "which one
-    did you mean?" picker instead of confirming three separate deletes.
+    """"delete tan, sec and cos" names three distinct targets --
+    find_delete_candidates' broad substring search would instead match
+    all similarly-named symbols as one ambiguous picker.
 
-    Splits the request on comma/and/&/; into phrases, and only returns a
-    result when EVERY phrase resolves to exactly one EXACT (not
-    substring) symbol name match that is itself unambiguous (not itself
-    defined more than once) -- deliberately strict: this is an
-    all-or-nothing fast path for genuinely unambiguous multi-target
-    requests, not a general list parser. Returns None (not []) whenever
-    that strict bar isn't met -- fewer than 2 phrases, any phrase with no
-    exact match, more than one exact match, or a matched name that's
-    itself duplicated -- so the caller falls back to the existing
-    single-target substring/disambiguation path unchanged."""
+    Splits on comma/and/&/; into phrases; returns a result only when
+    EVERY phrase resolves to exactly one EXACT, unambiguous symbol match
+    -- strict all-or-nothing. Returns None (not []) if that bar isn't
+    met, so the caller falls back to the normal single-target path."""
     words = user_request.strip().split()
     rest = " ".join(words[1:]) if words and words[0].lower() in _DELETE_VERBS else user_request
     phrases = [p.strip() for p in _DELETE_LIST_SEPARATOR_RE.split(rest) if p.strip()]
@@ -610,22 +508,10 @@ _RENAME_RE = re.compile(
 
 def find_rename_target(source: str, user_request: str, language: str = "python") -> Optional[Tuple[str, str]]:
     """(old_name, new_name) when the request is confidently a rename of
-    one function/class, zero LLM calls needed anywhere -- not even the
-    normal classification call, since neither name requires seeing any
-    body to be safely renamed: the request itself already says what to
-    rename and what to call it, and only a real, unambiguous (defined
-    exactly once) symbol name is accepted as old_name.
-
-    Deliberately restricted to actual function/class *definitions*
-    (index_symbols), not any word appearing anywhere in the source the
-    way find_delete_candidates' broad substring search works for a
-    destructive-but-reviewable delete -- a bare word match here would
-    risk this fully-mechanical, no-human-review-until-after path
-    renaming an unrelated same-named local variable or parameter in a
-    completely different function purely from a regex guess. A genuine
-    module-level variable rename (e.g. "replace col by column") still
-    goes through the normal LLM-driven escalate path instead, where the
-    model has actually seen the file before deciding old_name."""
+    one function/class -- zero LLM calls, since old_name must be a real,
+    unambiguous (defined once) symbol definition, never a bare word
+    match. A non-definition rename (e.g. a variable) falls through to the
+    normal LLM-driven path instead."""
     match = _RENAME_RE.match(user_request.strip())
     if not match:
         return None
@@ -650,23 +536,15 @@ def _match_case(replacement: str, like: str) -> str:
 
 
 def _rename_subword(identifier: str, old_name: str, new_name: str) -> Optional[str]:
-    """If `old_name` matches one of `identifier`'s own sub-words, or a
-    run of consecutive sub-words concatenated (case-insensitively) --
-    split the same convention-aware way for snake_case (split on '_')
-    and camelCase/PascalCase (split at case transitions, see
-    _CASE_TRANSITION_RE) -- returns the identifier with just that span
-    replaced, cased to match what it replaced, and every other sub-
-    word/separator left exactly as it was. Shortest match tried first
-    (a single sub-word before a multi-word span), so this never expands
-    further than it needs to. None if old_name isn't found in this
-    identifier at all, so the caller can leave an unrelated identifier
-    untouched.
+    """If `old_name` matches one of `identifier`'s sub-words (or a
+    concatenated run of them), split convention-aware (snake_case on '_',
+    camelCase/PascalCase at case transitions), replaces just that span
+    cased to match, leaves the rest untouched. Shortest match tried
+    first. None if old_name isn't found.
 
-    Multi-word spans matter for a real case: "OpenAI" inside
-    "buildOpenAIClient" splits into "Open"+"AI" sub-words (a trailing
-    capitalized acronym is its own split point) -- old_name="openai"
-    only ever matches when "Open"+"AI" are tried *together* as one
-    span, not as two separate single-word attempts."""
+    Multi-word spans matter: "OpenAI" inside "buildOpenAIClient" splits
+    into "Open"+"AI" sub-words, so old_name="openai" only matches when
+    both are tried together as one span."""
     if "_" in identifier:
         parts = identifier.split("_")
         for span_len in range(1, len(parts) + 1):
@@ -690,25 +568,16 @@ def _rename_subword(identifier: str, old_name: str, new_name: str) -> Optional[s
 
 
 def rename_with_subword_fallback(source: str, old_name: str, new_name: str) -> str:
-    """Renames every whole-word occurrence of old_name (\\bold_name\\b,
-    unchanged, exact behavior as before) -- and if that finds nothing
-    at all, falls back to renaming old_name wherever it's a sub-word
-    inside a longer camelCase/PascalCase identifier instead (e.g.
-    "OpenAI" inside "apiKeyOpenAI" or "buildOpenAIClient").
+    """Renames every whole-word occurrence of old_name; if that finds
+    nothing, falls back to renaming it as a sub-word inside a longer
+    camelCase/PascalCase identifier (e.g. "OpenAI" inside
+    "buildOpenAIClient") -- a plain \\bold_name\\b regex has no concept
+    of a case transition as a word boundary, so it misses these
+    otherwise.
 
-    Real bug this closes: "use anthropic instead of openai" against a
-    Go file using apiKeyOpenAI/buildOpenAIClient silently renamed
-    nothing and reported a safe-but-useless no-op -- a plain
-    \\bold_name\\b regex has no concept of a lowercase-to-uppercase
-    transition as a word boundary, only underscores/non-alphanumerics,
-    so it never found "OpenAI" packed inside those identifiers at all.
-
-    Not a per-language rule: camelCase/PascalCase/snake_case are naming
-    *conventions*, not languages -- Java, JavaScript, C#, Go, and Python
-    all mix them routinely, so this generalizes across every language
-    this project supports the same way, reusing the exact camelCase-
-    splitting convention retrieval/bm25_retriever.py's own tokenizer
-    already established rather than inventing a second one."""
+    Convention-based, not per-language: camelCase/PascalCase/snake_case
+    mix across every language this project supports, reusing
+    bm25_retriever.py's existing camelCase-splitting convention."""
     whole_word_re = re.compile(rf"\b{re.escape(old_name)}\b")
     new_source = whole_word_re.sub(new_name, source)
     if new_source != source:

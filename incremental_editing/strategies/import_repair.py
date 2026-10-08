@@ -1,22 +1,8 @@
-"""IMPORT_REPAIR strategy: fix ONLY a broken import block, instead of
-regenerating the whole file, when a mechanical rename (see
-run_pipeline._run_rename_identifier) leaves an inconsistent reference --
-a class/function/module name renamed everywhere it's *used*, but not
-inside the import statement that names its own module path (real case:
-"replace openai with xai" renamed OpenAI-the-class everywhere, but
-`from openai import OpenAI` mechanically became `from xai import OpenAI`
--- syntactically valid, a real ModuleNotFoundError the instant it runs).
-
-Before this existed, ANY import breakage here escalated straight to
-`_run_whole_file_edit` -- a full file regeneration, discarding the
-mechanical rename's own (otherwise entirely correct) output and asking
-the model to reconstruct the *entire* file from scratch to fix a handful
-of broken lines. Same reasoning TEXT_BLOCK_EDIT already applies to a
-markdown/YAML section: locate the one contiguous region that's actually
-wrong, send only that as input and expected output, splice it back by
-line range. Falls back to the existing whole-file path automatically
-(run_pipeline's own responsibility, not this module's) when this doesn't
-resolve the import error.
+"""IMPORT_REPAIR strategy: fix only a broken import block instead of
+regenerating the whole file, for when a mechanical rename (see
+run_pipeline._run_rename_identifier) renames a symbol everywhere it's used
+but misses the import statement naming its own module path. Falls back to
+whole-file edit (run_pipeline's responsibility) if this doesn't resolve it.
 """
 
 from typing import Optional

@@ -1,8 +1,5 @@
-"""Multi-dimension confidence (PHOENIX doc section 22): never one global
-score. Retrieval confidence here comes from how far the top fused
-candidate's score is ahead of the runner-up -- a clear winner reads as
-high confidence, a near-tie reads as low, regardless of the absolute
-score value (which the RRF formula makes hard to interpret on its own).
+"""Confidence comes from how far the top fused candidate is ahead of the
+runner-up, not the absolute RRF score (hard to interpret on its own).
 """
 
 from typing import List, Tuple

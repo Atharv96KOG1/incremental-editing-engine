@@ -1,10 +1,6 @@
-"""Single source of truth for every env-configurable value.
-
-Replaces scattered `os.getenv(...)` calls across storage/strategies/
-benchmark modules. Loaded once via `get_settings()`; reads `.env` itself
-(no separate `load_dotenv()` needed), so `iee serve`'s long-running process
-picks up config from `.env` in the working directory without the caller
-having to `source .env` first.
+"""Single source of truth for every env-configurable value. Loaded once via
+`get_settings()`; reads `.env` itself, so a long-running process picks up
+config without the caller having to `source .env` first.
 """
 
 from functools import lru_cache

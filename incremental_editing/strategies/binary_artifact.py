@@ -1,22 +1,11 @@
 """Real binary file creation (.xlsx, .db, .docx, .pptx, .pdf, ...).
 
-generate_full_file's normal path pastes the model's raw text output
-straight onto disk -- correct for any plain-text format (.py, .csv,
-.json, .sql, ...), where the model's output literally *is* the file.
-It cannot work for a real binary/structured format: an LLM can't emit
-raw OOXML zip bytes or a real SQLite page format as chat completion
-text. Observed failure this fixes: "make new excel file and add the
-data of Agentic AI" produced a file literally named "Agentic_AI.xlsx"
-whose actual bytes were a Python script (using openpyxl) that would
-create the real file *if executed* -- never executed, so opening it in
-Excel fails. Same failure for "make a new sqlite database file".
-
-Fix: for these extensions, ask the model for that same kind of script
-(it already tends to write one unprompted) but then actually RUN it in
-a disposable temp directory -- same risk class as the pytest subprocess
-this project already runs on every edit -- and capture the REAL bytes
-it produces instead of the script text. The script itself is never
-kept as the file's content.
+The normal create-file path writes the model's raw text straight to disk,
+which only works for plain-text formats -- a model can't emit real OOXML/
+SQLite bytes as chat text (observed failure: an "Agentic_AI.xlsx" whose
+actual bytes were an unexecuted openpyxl script). Fix: ask the model for
+that generator script, actually run it in a disposable temp directory, and
+keep the real bytes it produces instead of the script text.
 """
 
 import base64
@@ -41,11 +30,9 @@ def is_binary_artifact_target(path: str) -> bool:
 
 
 def binary_artifact_instructions(path: str) -> str:
-    """Appended to the normal create-file request when the target is a
-    binary format -- tells the model what to write instead of a literal
-    file body: a script that produces the real thing when run, not the
-    real thing itself (that part -- actually running it -- is this
-    module's job, not the model's)."""
+    """Appended to the create-file request for a binary target: tells the
+    model to write a script that produces the file when run, not the file
+    itself (running it is this module's job)."""
     ext = Path(path).suffix.lower()
     library = BINARY_ARTIFACT_LIBRARIES[ext]
     return (
@@ -63,14 +50,11 @@ class BinaryArtifactError(Exception):
 
 
 def materialize_binary_artifact(script: str, target_relpath: str, timeout: float = 30.0) -> bytes:
-    """Runs `script` (the model's generated Python) in a fresh temp
-    directory using this same interpreter (sys.executable -- not a bare
-    "python3", which could silently resolve to a different environment
-    missing the libraries this project's own venv actually has), then
-    reads back the real bytes of whatever it created at
-    `target_relpath`. Raises BinaryArtifactError with the script's own
-    stderr on a non-zero exit or a missing/empty output file -- there's
-    no partial-success case worth papering over here."""
+    """Runs `script` in a fresh temp directory using this same
+    interpreter (sys.executable, not a bare "python3" that could resolve
+    to a different environment), then reads back the real bytes at
+    `target_relpath`. Raises BinaryArtifactError on a non-zero exit or a
+    missing/empty output file."""
     with tempfile.TemporaryDirectory() as tmp:
         tmp_dir = Path(tmp)
         script_path = tmp_dir / "_generate.py"
@@ -105,23 +89,18 @@ def materialize_binary_artifact(script: str, target_relpath: str, timeout: float
 
 
 def generate_binary_artifact_base64(script: str, target_relpath: str, timeout: float = 30.0) -> str:
-    """materialize_binary_artifact, then base64-encodes the real bytes
-    into a plain string -- so every existing `files: Dict[str, str]`
-    pipeline (versioning checkpoints, patches storage, the confirm/
-    reject stash) keeps working completely unchanged. Only the final
-    on-disk write (write_file_content, below) needs to know the
-    difference between this and literal text."""
+    """Base64-encodes materialize_binary_artifact's bytes so the existing
+    `files: Dict[str, str]` pipeline (versioning, patches, confirm/reject
+    stash) needs no changes; only write_file_content needs to know the
+    difference from literal text."""
     return base64.b64encode(materialize_binary_artifact(script, target_relpath, timeout)).decode("ascii")
 
 
 def write_file_content(target: Path, path: str, content: str) -> None:
-    """Writes `content` to `target` -- base64-decoding it first when
-    `path` is a binary artifact target (generate_binary_artifact_base64
-    is what produces that encoded form). The one place the byte/text
-    distinction actually has to be handled at every real disk-write
-    site (the project directory itself, and the disposable temp copy
-    the test runner uses) instead of threading a second, bytes-typed
-    dict through every function in between."""
+    """Writes `content` to `target`, base64-decoding first when `path` is
+    a binary artifact target. Keeps the byte/text distinction isolated to
+    this one write site instead of threading a bytes-typed dict through
+    every function in between."""
     target.parent.mkdir(parents=True, exist_ok=True)
     if is_binary_artifact_target(path):
         target.write_bytes(base64.b64decode(content))

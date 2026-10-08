@@ -791,6 +791,34 @@
   color: var(--text-faint);
   font-size: 12px;
 }
+.candidate-chip-selected {
+  border-color: var(--accent);
+  background: var(--bg-elevated);
+  box-shadow: 0 0 0 1px var(--accent) inset;
+}
+.candidate-picker-confirm {
+  margin-top: 10px;
+  border: 1px solid var(--accent);
+  background: var(--accent);
+  color: white;
+  border-radius: 8px;
+  padding: 6px 14px;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  box-shadow: var(--shadow-sm);
+}
+.candidate-picker-confirm:hover:not(:disabled) {
+  background: var(--accent-hover);
+  transform: translateY(-1px);
+}
+.candidate-picker-confirm:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
+  background: var(--bg-elevated-2);
+  color: var(--text-faint);
+  border-color: var(--border);
+}
 
 /* ---- target-file chip (shows which file the next request will edit) ---- */
 .target-file-chip-row {

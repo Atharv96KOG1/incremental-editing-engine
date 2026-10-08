@@ -1,20 +1,11 @@
 """Ties hybrid retrieval together: repo index -> symbol/BM25/vector/
 Semgrep-structural retrieval -> fusion -> risk + confidence + evidence.
+Picks which file/symbol; the existing single-file pipeline takes over
+unchanged once a file is found.
 
-This is the "which file/symbol" layer that sits in front of the existing
-single-file locator (`analyzer/locator.py`): once this picks a file, the
-existing single-file pipeline (context_builder, structured_edit,
-edit_applier, ...) takes over exactly as it did before -- nothing about
-the actual editing changed, only how the target file gets found when the
-caller doesn't already know it.
-
-The Semgrep structural signal is a *meaning* check, not another keyword
-matcher: text/vector retrieval can only tell you a candidate's words
-resemble the request; Semgrep confirms whether the candidate's code
-actually *does* what the request describes (raises an exception,
-validates types, calls a math function, ...). It only ever adds
-candidates a broader first pass already surfaced -- it can't invent one
-BM25/vector/symbol retrieval missed entirely.
+Semgrep is a meaning check, not a keyword matcher -- it confirms a
+candidate's code actually does what the request describes, only
+narrowing among candidates another signal already surfaced.
 """
 
 from typing import Optional
@@ -37,14 +28,9 @@ _LOW_CONFIDENCE_THRESHOLD = 0.6
 
 
 def _safe_vector_ranking(symbols, request: str, top_k: int) -> list:
-    """Vector retrieval is one signal among several -- like Semgrep's
-    structural check and the locator's semantic tiebreak, a failure here
-    (embeddings gateway cold-starting, a network blip, briefly down) must
-    degrade to "this signal didn't fire" and let symbol+BM25 carry the
-    request, not crash the whole find/locate call. A real gateway cold
-    start was observed taking 8+ seconds against a normal sub-second
-    baseline -- exactly the kind of transient failure this must absorb
-    rather than propagate."""
+    """Vector retrieval is one signal among several; a failure (embeddings
+    gateway cold start -- observed taking 8+s vs a sub-second baseline, or
+    a network blip) must degrade to no signal rather than crash the call."""
     try:
         return VectorRetriever(symbols).rank(request, top_k=top_k)
     except Exception:
@@ -59,13 +45,10 @@ def locate(
     use_joern=False,
     top_k: int = 5,
 ) -> dict:
-    """`use_joern` is a tri-state, not a plain bool: False (default,
-    unchanged from before) never runs Joern; True forces it every call;
-    "auto" is the confidence/need gate -- it only pays Joern's real build
-    cost (~12-45s+, see build_call_graph_via_joern) when this call's own
-    computed confidence is actually low. Accepting the literal string
-    "False"/"True"/"auto" (not just a bool) lets this be driven directly
-    by a CLI choice argument or a web select without extra translation."""
+    """`use_joern` is tri-state: False never runs Joern, True always does,
+    "auto" only pays Joern's real build cost (~12-45s+) when computed
+    confidence is low. Accepts the string forms too, so a CLI flag or web
+    select can drive it directly."""
     use_joern = {"true": True, "false": False, "auto": "auto"}.get(str(use_joern).lower(), use_joern)
     symbols = build_repo_index(project_dir)
     if not symbols:
@@ -144,21 +127,14 @@ def locate(
 
 
 def locate_best_file(project_dir: str, request: str, use_vector: bool = False, wide_k: int = 5) -> Optional[str]:
-    """Fast 'which file' lookup for auto-locating an edit target -- unlike
-    `locate()`, this never touches semgrep or the dependency graph.
+    """Fast 'which file' lookup for auto-locating an edit target -- skips
+    semgrep and the dependency graph, both pure enrichment for `iee find`'s
+    output (semgrep's per-candidate subprocess spawn is the pipeline's
+    largest single cost, ~1-2+s each).
 
-    Both are pure enrichment `locate()` attaches for `iee find`'s
-    exploratory output (call sites, callers, structural verification) --
-    never what decides the single best file -- and semgrep spawning a
-    subprocess per shortlisted candidate is by far the largest cost in the
-    full pipeline (each spawn: a real 1-2+ second cold start). Building the
-    repo-wide call graph costs a full extra parse pass over every symbol
-    for the same reason: irrelevant when the caller only wants a file path.
-
-    Vector retrieval defaults off too: symbol+BM25 alone already resolves
-    most single-file lookups, and skipping it removes a real embeddings-API
-    network round trip from the hot edit-request path. Pass use_vector=True
-    when precision matters more than latency for a specific call."""
+    Vector retrieval defaults off too, keeping the hot edit path free of an
+    embeddings-API round trip; pass use_vector=True when precision matters
+    more than latency."""
     symbols = build_repo_index(project_dir)
     if not symbols:
         return None

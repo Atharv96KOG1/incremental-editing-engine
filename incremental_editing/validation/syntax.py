@@ -1,16 +1,10 @@
-"""Cheapest validation gate: does the generated code even parse.
+"""Cheapest validation gate: does the generated code even parse. Python
+uses `ast.parse()`; other languages go through Tree-sitter, detected from
+the file's extension and skipped (not failed) when unrecognized.
 
-Python files use Python's own ast.parse() (zero extra dependency,
-already proven, faster). Every other language goes through Tree-sitter --
-one parser library with grammars for 100+ languages -- matching the
-"Python AST initially, Tree-sitter later for multi-language" plan the
-original architecture doc set out from day one. The language is detected
-from the file's own extension; an extension Tree-sitter doesn't recognize
-is left unvalidated (skipped, not failed) rather than guessed at.
-
-Tree-sitter's parser is error-tolerant -- it always returns *some* tree,
-even for invalid input -- so "did this parse" isn't an exception to catch,
-it's "does the resulting tree contain an ERROR node or a MISSING token".
+Tree-sitter's parser is error-tolerant and always returns some tree, so
+"did this parse" means checking for an ERROR node or MISSING token, not
+catching an exception.
 """
 
 import ast
@@ -71,25 +65,14 @@ def check_syntax(source: str, filename: str = "<generated>") -> None:
 
 
 def check_python_imports(relpath: str, cwd: str, timeout: float = 15.0) -> None:
-    """Genuinely imports the file (in a subprocess, cwd set to a real
-    copy of the project so sibling imports resolve) and raises
-    SyntaxCheckError if that fails -- ast.parse only proves the file is
-    grammatically valid Python, not that every name it references
-    actually exists where it's imported from.
-
-    Real bug this catches: a mechanical rename (see
-    run_pipeline._run_rename_identifier) correctly renamed a *class
-    reference* (ChatOpenAI -> ChatAnthropic) but not the *import
-    statement's own module path* it also appeared in, producing
-    `from langchain_openai import ChatAnthropic` -- syntactically
-    perfect Python, and a real ImportError the instant anything actually
-    runs it. check_syntax alone reported this as passing; a project
-    with no test suite covering this file's imports (common for a
-    prototype, and true of the real case this was caught against) means
-    pytest never imports it either, so nothing else in this pipeline
-    would have caught it. Only ever runs a plain `import` -- real
-    side-effecting work belongs behind `if __name__ == "__main__":`,
-    which import itself never executes, same as pytest collection."""
+    """Actually imports the file in a subprocess (cwd set to a real copy
+    of the project) and raises SyntaxCheckError on failure -- ast.parse
+    only proves the file is grammatically valid, not that every
+    referenced name actually exists. Caught a real case: a mechanical
+    rename updated a class reference but not its import statement's
+    module path, producing a syntactically valid but unimportable file
+    that no test suite would catch. Only ever runs a plain import; real
+    side-effecting work belongs behind `if __name__ == "__main__":`."""
     if not relpath.endswith(".py"):
         return
     module_name = relpath[:-3].replace("/", ".").replace("\\", ".")

@@ -1,11 +1,7 @@
-"""BM25 keyword retrieval over the repo-wide symbol index (PHOENIX doc
-section 4: "BM25 is strong for exact identifiers and rare terms").
-
-Each symbol becomes one BM25 "document": its name, docstring, and its own
-source text, tokenized. This is complementary to the AST-based literal
-name matching in `analyzer/locator.py` -- BM25 additionally rewards a
-request that shares *rare, specific* words with a symbol's body even when
-it never mentions the symbol's name at all.
+"""BM25 keyword retrieval over the repo-wide symbol index. Each symbol is one
+BM25 document (name, docstring, source), tokenized. Complements the AST-based
+literal name matching in `analyzer/locator.py` by rewarding shared rare words
+even when the symbol's name is never mentioned.
 """
 
 import re

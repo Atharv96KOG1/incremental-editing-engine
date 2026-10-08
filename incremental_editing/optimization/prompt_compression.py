@@ -1,23 +1,7 @@
-"""Rule-based compression for the STATIC instructional text we author
-ourselves (system prompts, wrapper phrases around dynamic content) --
-drops filler (articles, hedging adverbs, redundant phrasing) the same way
-caveman-style compression does for a human reader, but far more
-conservative: this text controls model *correctness*, not just brevity,
-so a small, explicit, testable set of rules, never a free-form rewrite.
-
-Where this must NEVER be used: actual code (`content` fields, generated
-files), docstrings, symbol/variable names, or the user's own request
-text. Those aren't filler-laden instructional prose -- they're either
-executable code (compressing it would corrupt the program) or meaning
-we don't own and have no business rewording. This module only ever
-touches strings we wrote ourselves as instructions to the model.
-
-The one hard rule: a fixed set of "protected" words -- negations and
-absolutes that flip an instruction's meaning if dropped -- must survive
-every single compression, with the same count, every time. `compress()`
-enforces this itself (raises rather than silently violating it), and
-`words_preserved()` is exposed separately for tests to assert on.
-"""
+"""Rule-based filler compression for our own static system-prompt text only --
+never code, docstrings, symbol names, or user request text. Protected words
+(negations/absolutes) must survive every compression; `compress()` enforces
+this by raising rather than silently dropping one."""
 
 import re
 from collections import Counter
@@ -44,11 +28,9 @@ def _protected_word_counts(text: str) -> Counter:
 
 
 def compress(text: str) -> str:
-    """Drops filler from `text` and collapses the whitespace that leaves
-    behind. Raises AssertionError if doing so changed the count of any
-    protected word -- a compression that silently drops a "not" is a
-    correctness bug, not an optimization, so this fails loudly rather
-    than shipping a prompt that quietly means something different."""
+    """Drops filler and collapses whitespace. Raises if any protected word's
+    count changed -- a silently dropped "not" is a correctness bug, not an
+    optimization."""
     compressed = text
     for pattern in _DROP_PATTERNS:
         compressed = pattern.sub("", compressed)
@@ -64,8 +46,6 @@ def compress(text: str) -> str:
 
 
 def words_preserved(original: str, compressed: str) -> bool:
-    """True if every protected word appears the same number of times in
-    both strings. Exposed separately (rather than only inside compress())
-    so tests can assert on it directly, including against text that
-    didn't go through compress() at all."""
+    """True if every protected word appears the same number of times in both
+    strings. Exposed separately so tests can assert on it directly."""
     return _protected_word_counts(original) == _protected_word_counts(compressed)

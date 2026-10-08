@@ -7,7 +7,7 @@ import RetrievalResults from './RetrievalResults.jsx'
 import CandidatePicker from './CandidatePicker.jsx'
 import AnswerCard from './AnswerCard.jsx'
 
-export default function Message({ message, onSelectCandidate, onConfirmRun }) {
+export default function Message({ message, onConfirmCandidates, onConfirmRun }) {
   if (message.role === 'user') {
     return (
       <div className="message-row message-row-user">
@@ -50,7 +50,7 @@ export default function Message({ message, onSelectCandidate, onConfirmRun }) {
           <CandidatePicker
             candidates={message.metadata.candidates}
             disabled={message.selectionPending}
-            onSelect={(candidate) => onSelectCandidate(message.id, candidate, message.metadata)}
+            onConfirm={(candidates) => onConfirmCandidates(message.id, candidates, message.metadata)}
           />
         ) : isRetrieval ? (
           <RetrievalResults metadata={message.metadata} />

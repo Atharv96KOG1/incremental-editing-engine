@@ -1,12 +1,7 @@
-"""CREATE path: bootstrap a brand-new file from a prompt.
-
-Not part of the doc's core incremental-editing hypothesis (that's about
-*existing* artifacts) -- but you need an artifact before you can
-incrementally edit one. Uses FULL_REGENERATION (doc section 10, Approach A)
-since there's no existing file to localize context against or diff.
-
-Same callback-driven, non-raising shape as `run_edit` in run_pipeline.py so
-cli.py can drive both uniformly.
+"""CREATE path: bootstrap a brand-new file from a prompt. Uses
+FULL_REGENERATION since there's no existing file to localize context
+against or diff. Same callback-driven, non-raising shape as `run_edit` in
+run_pipeline.py so cli.py can drive both uniformly.
 """
 
 import os
@@ -49,23 +44,20 @@ def run_create(
     on_preview: Callable[[dict], None] = lambda data: None,
     classification_gen: Optional[dict] = None,
 ) -> dict:
-    """Always returns a metadata dict (check metadata["result"]["status"]).
-    Only raises for programmer errors (target file already exists, bad args).
+    """Always returns a metadata dict (check metadata["result"]["status"]);
+    only raises for programmer errors (target file exists, bad args).
 
     `on_preview` fires once, right after GENERATE, with
-    {"new_file_content": "...", "file": "..."} -- before SYNTAX/TEST even run.
+    {"new_file_content": "...", "file": "..."} -- before SYNTAX/TEST run.
 
-    `require_confirmation=True` (web UI only, CLI never sets it) pauses
-    right after syntax/tests pass but before the file is written: returns
-    early with result.status == "awaiting_confirmation", nothing written
-    to disk until `pending_confirmations.resolve` is called -- see that
-    module's docstring and run_pipeline.run_edit's matching parameter.
+    `require_confirmation=True` (web UI only) pauses after syntax/tests pass
+    but before the file is written, returning early with
+    result.status == "awaiting_confirmation" until
+    `pending_confirmations.resolve` is called.
 
-    `classification_gen` folds in a prior LLM call's usage (e.g. webapp.py's
-    create_target_classifier, run when edit mode's auto-locate found nothing
-    and this create was dispatched to instead) so the returned cost is
-    honest -- that call's tokens are real, not free just because they
-    happened before this function was ever entered."""
+    `classification_gen` folds in a prior LLM call's usage (e.g. the
+    create-intent classifier run when edit-mode auto-locate found nothing)
+    so the returned cost stays honest."""
 
     if not file:
         raise ValueError("create mode needs a file path -- the File field can't be left blank")
@@ -212,19 +204,13 @@ def run_create_files(
     on_preview: Callable[[dict], None] = lambda data: None,
     classification_gen: Optional[dict] = None,
 ) -> dict:
-    """Top-level entry point for creating SEVERAL files/folders in one
-    request with no existing anchor file at all -- the multi-path sibling
-    of `run_create` above, for exactly the case that one can't express:
-    "frontend and backend in separate folders" needs paths under both
-    frontend/ and backend/, never merged into one file, and CREATE mode's
-    own one-file-at-a-time flow has no way to ask for that without N
-    manual mode switches.
+    """Creates several files/folders in one request with no existing anchor
+    file -- the multi-path sibling of `run_create` above, for a request like
+    "frontend and backend in separate folders" that one file can't express.
 
-    Does the same project_dir/project_id/storage/version setup `run_create`
-    does, then delegates the real work to `run_pipeline._run_create_files`
-    (the same function an escalated EDIT-mode request already uses for
-    this exact shape) with `also_link_current_file=False` and an empty
-    anchor -- there's no existing file to link these new ones to here."""
+    Does the same setup as `run_create`, then delegates to
+    `run_pipeline._run_create_files` with `also_link_current_file=False`
+    and no anchor, since there's no existing file to link to here."""
     project_dir = Path(project_dir).resolve()
     project_id = project_id or project_dir.name.lower()
 

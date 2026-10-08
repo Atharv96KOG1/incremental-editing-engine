@@ -1,25 +1,13 @@
-"""Personalized PageRank over the repo's own call graph -- a structural
-"how central/connected is this symbol" signal, complementing the purely
-textual BM25/vector/name-match signals hybrid retrieval already fuses.
+"""Personalized PageRank over the repo's call graph -- a structural
+centrality signal complementing the textual BM25/vector/name-match
+signals hybrid retrieval already fuses. Adapted from Aider's repo-map
+ranking, reimplemented at symbol granularity over this project's own call
+graph (`dependency_graph.py`), using plain NumPy power iteration instead
+of adding `networkx` as a dependency.
 
-Adapted from Aider's own repo-map ranking (`aider/repomap.py`'s
-`get_ranked_tags`: a personalized PageRank over a referencer -> definer
-graph, weighted by identifier "interestingness" and boosted for names
-the request itself mentions) -- reimplemented here at symbol granularity
-over this project's own existing call graph (`dependency_graph.py`)
-instead of a second tags/graph pass, and with a plain NumPy power
-iteration instead of adding `networkx` as a new dependency (NumPy is
-already one; this project's own established preference is a small
-dependency footprint, see requirements.txt).
-
-Real motivation this closes: a vague request ("fix the auth bug") can
-textually match nothing in particular, but the actual, heavily-called
-`authenticate()` function is exactly what a human would reach for --
-structural centrality (how many other symbols call this one, directly
-or transitively) is a real, different signal name/BM25/vector matching
-can't provide on its own, and this project already computes the call
-graph they'd need anyway (`retrieval/dependency_graph.py`, built for
-`iee find`'s own "calls"/"called_by" evidence)."""
+Lets a vague request ("fix the auth bug") still surface a heavily-called
+`authenticate()` even when it textually matches nothing -- call-graph
+centrality is a signal name/BM25/vector matching can't provide alone."""
 
 from typing import Dict, List, Optional, Tuple
 
@@ -39,10 +27,9 @@ def _personalized_pagerank(
     tol: float = 1e-6,
 ) -> Dict[str, float]:
     """Standard personalized-PageRank power iteration. `edges` is
-    (referencer, definer, weight): rank flows FROM a referencer TO
-    whatever it references -- same direction Aider's own repo-map graph
-    uses, so a symbol many things call accumulates rank from all of
-    them, not the other way around."""
+    (referencer, definer, weight); rank flows from referencer to what it
+    references, so a symbol many things call accumulates rank from all of
+    them."""
     n = len(nodes)
     if n == 0:
         return {}
@@ -82,20 +69,14 @@ def graph_centrality_ranking(
     call_graph: Optional[dict] = None,
     top_k: Optional[int] = None,
 ) -> List[Tuple[RepoSymbol, float]]:
-    """Duck-typed the same way BM25Retriever.rank()/VectorRetriever.rank()
-    already are -- [(symbol, score), ...] ranked highest first -- so it
-    drops straight into an existing fuse([...]) call alongside them.
-
-    `call_graph` lets a caller that already built one (e.g. locate_repo.
-    locate(), which needs it anyway for candidate evidence) pass it in
-    rather than paying a second identical AST/Tree-sitter pass.
-
-    Personalization boosts any symbol whose own name is a real content
-    word in the request -- the same word-overlap technique locate_
-    candidates already uses, not a new heuristic -- the same role
-    Aider's own "mentioned_idents" plays in its repo-map ranking: without
-    it, PageRank alone would just re-rank by raw call-graph popularity,
-    ignoring the request's own wording entirely."""
+    """Duck-typed like BM25Retriever.rank()/VectorRetriever.rank() --
+    [(symbol, score), ...] highest first -- so it drops into an existing
+    fuse([...]) call. `call_graph` lets a caller that already built one
+    reuse it instead of paying for a second pass. Personalization boosts
+    symbols whose name is a real content word in the request (same
+    word-overlap technique locate_candidates uses); without it, PageRank
+    would just rank by raw call-graph popularity, ignoring the request's
+    own wording."""
     if len(repo_symbols) < 2:
         return []
 

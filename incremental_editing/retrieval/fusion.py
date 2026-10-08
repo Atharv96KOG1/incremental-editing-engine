@@ -1,13 +1,6 @@
-"""Reciprocal Rank Fusion across the symbol/BM25/vector retrievers
-(PHOENIX doc section 4: "Retrieval maximizes recall; reranking maximizes
-precision").
-
-Any one signal alone can mislead: BM25 misses synonyms and paraphrases,
-vector search can drift toward vaguely-similar-sounding but wrong code,
-literal name matching only works when the request actually names the
-symbol. Fusing *rankings* (not raw scores, which live on incomparable
-scales -- a BM25 score and a cosine similarity mean nothing next to each
-other) is what makes combining them robust.
+"""Reciprocal Rank Fusion across the symbol/BM25/vector retrievers. Fuses
+*rankings*, not raw scores -- a BM25 score and a cosine similarity live on
+incomparable scales.
 """
 
 from typing import List, Tuple
@@ -22,10 +15,9 @@ def _key(sym: RepoSymbol) -> tuple:
 
 
 def fuse(rankings: List[List[Tuple[RepoSymbol, float]]], top_k: int = 5) -> List[Tuple[RepoSymbol, float]]:
-    """`rankings` is one ranked (symbol, score) list per retriever. Returns
-    the fused top_k, each symbol's fused score being the sum of
-    1/(k + rank) across every retriever that surfaced it -- so a symbol
-    every retriever agrees on outranks one only a single retriever liked."""
+    """`rankings` is one (symbol, score) list per retriever. Fused score is the
+    sum of 1/(k + rank) across retrievers, so agreement across retrievers
+    outranks a single strong signal."""
     fused_scores = {}
     symbol_by_key = {}
 

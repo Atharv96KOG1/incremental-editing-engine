@@ -1,9 +1,8 @@
 """STRUCTURED_EDIT strategy: ask the model for a Delta IR JSON object directly.
 
-`generate_repair()` is the bounded self-repair path (PHOENIX architecture
-doc, section 18): instead of retrying with the exact same prompt, it shows
-the model its own previous (failed) Delta IR plus the classified failure
-and the real error text, and asks for a corrected one.
+`generate_repair()` is the bounded self-repair path: shows the model its
+own previous (failed) Delta IR plus the classified failure and real error
+text, and asks for a corrected one, instead of a blind retry.
 """
 
 import json
@@ -127,13 +126,9 @@ STRICT_DELTA_RESPONSE_SCHEMA = {
 
 
 def _strip_strict_nulls(delta_dict: dict) -> dict:
-    """Undoes strict mode's required-but-nullable convention right after
-    parsing, so every consumer downstream of this call keeps seeing the
-    exact same optional-key-may-be-absent shape it always has -- an
-    explicit `"content": null` becomes simply no "content" key, matching
-    what a DELETE operation always looked like before strict mode existed
-    (and what delta.schema.DELTA_JSON_SCHEMA's own lenient validation
-    still expects)."""
+    """Converts strict mode's required-but-nullable fields back to absent
+    keys, matching the optional-key-may-be-absent shape downstream code
+    (and DELTA_JSON_SCHEMA's lenient validation) expects."""
     if delta_dict.get("escalate") is None:
         delta_dict.pop("escalate", None)
     else:
@@ -154,11 +149,8 @@ def _strip_strict_nulls(delta_dict: dict) -> dict:
 
 def _fill_known_fields(delta_dict: dict, file_path: str, base_version: str) -> None:
     """Backfills schema_version, base_version, and each operation's
-    target.file onto the model's (now slimmer) response -- values this
-    call already had before it was ever made, never requested from the
-    model in the first place. Mutates in place; called on every
-    generate_delta/generate_repair result before anything downstream
-    (schema validation, DeltaIR parsing) ever sees it."""
+    target.file -- values already known, never asked of the model.
+    Mutates in place."""
     delta_dict.setdefault("schema_version", DELTA_SCHEMA_VERSION)
     delta_dict.setdefault("base_version", base_version)
     for op in delta_dict.get("operations", []):

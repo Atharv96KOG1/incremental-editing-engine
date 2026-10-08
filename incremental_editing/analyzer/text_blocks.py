@@ -1,19 +1,15 @@
 """LLM-free locator for files with no function/class concept at all --
-markdown, YAML, TOML, INI, Dockerfile, plain text, dotenv, and anything
-else `multilang_symbols.language_has_symbol_concept()` says has no
-symbols. Treats a file's own natural section structure as pseudo-symbols
-(reusing locator.SymbolInfo, symbol_type="block") instead of giving up
-and sending the whole file: a markdown heading, a TOML/INI [section], or
-a YAML top-level key each become one block; anything without a native
-marker (Dockerfile, .env, plain text) falls back to blank-line-separated
-paragraphs -- a convention nearly every text format already uses on its
-own, universal rather than per-format.
+markdown, YAML, TOML, INI, Dockerfile, plain text, dotenv, etc. Treats a
+file's own natural section structure as pseudo-symbols (reusing
+locator.SymbolInfo, symbol_type="block") instead of sending the whole
+file: a markdown heading, TOML/INI [section], or YAML top-level key each
+become one block; anything without a native marker falls back to
+blank-line-separated paragraphs.
 
-Deliberately the same shape and matching technique analyzer/locator.py
-already uses for functions (literal-name-in-request + word overlap), so
-context_builder-style localization and hybrid retrieval apply to these
-exactly the way they do to real symbols -- one locator technique, not a
-pile of per-format special cases.
+Same matching technique analyzer/locator.py uses for functions
+(literal-name-in-request + word overlap), so context_builder-style
+localization and hybrid retrieval apply to blocks the same way they do
+to real symbols.
 """
 
 import re
@@ -31,9 +27,8 @@ _YAML_TOP_KEY_RE = re.compile(r"^([A-Za-z0-9_.\-]+):(?:\s|$)")
 
 
 def _html_child_name(element, source_bytes: bytes) -> str:
-    """A short, human-identifying label for an HTML element -- its tag
-    name, plus #id or .first-class-name when present, close to how a
-    person would actually refer to it ("header", "section#features"),
+    """A short, human-identifying label for an HTML element -- tag name,
+    plus #id or .first-class-name when present (e.g. "section#features"),
     not a raw excerpt of markup."""
     start_tag = next((c for c in element.children if c.type == "start_tag"), None)
     if start_tag is None:
@@ -71,14 +66,12 @@ def _find_element_by_tag(node, tag_name: str, source_bytes: bytes):
 
 
 def _html_blocks(source: str) -> List[SymbolInfo]:
-    """Real tag-nesting-aware blocks for HTML -- each direct child
-    element of <body> (or of the document root, for a bare fragment
-    with no <body> tag), extended to cover the whitespace/text up to
-    the next sibling the same way a marker-based block does. Built from
-    tree-sitter's actual parse tree, not blank-line guessing: a typical
-    hand-formatted HTML file has no blank lines between tags at all, so
-    the universal blank-line fallback alone finds nothing to localize
-    against and every HTML edit fell through to a full-file rewrite."""
+    """Tag-nesting-aware blocks for HTML -- each direct child element of
+    <body> (or the document root for a bare fragment), extended to cover
+    whitespace/text up to the next sibling. Built from tree-sitter's parse
+    tree rather than blank-line guessing: typical hand-formatted HTML has
+    no blank lines between tags, so the blank-line fallback alone finds
+    nothing to localize against."""
     from tree_sitter_language_pack import get_parser
 
     source_bytes = source.encode("utf-8")
@@ -123,10 +116,9 @@ def _blocks_from_markers(lines: List[str], marker_re: "re.Pattern", name_group: 
 
 
 def _blocks_from_blank_lines(lines: List[str]) -> List[SymbolInfo]:
-    """Universal fallback when the format has no native section marker:
-    groups of consecutive non-blank lines, separated by one or more
-    blank lines. A block's "name" is its own first line (truncated) --
-    there's no other natural label to give it."""
+    """Fallback when the format has no native section marker: groups of
+    consecutive non-blank lines, separated by blank lines. A block's
+    "name" is its own first line (truncated)."""
     blocks: List[SymbolInfo] = []
     start: Optional[int] = None
     for i, line in enumerate(lines, start=1):
@@ -149,13 +141,11 @@ def _make_blank_line_block(lines: List[str], start: int, end: int) -> SymbolInfo
 
 
 def index_text_blocks(source: str, language: Optional[str]) -> List[SymbolInfo]:
-    """Every block in `source`, covering the whole file with no gaps
-    and no overlaps -- markdown headings, TOML/INI sections, or YAML
-    top-level keys when the format has one; real tag-nesting-aware
-    blocks for HTML (a blank-line heuristic finds nothing in typical,
-    densely-formatted markup); blank-line paragraphs otherwise (falling
-    back to them too if the file happens to have none of its own
-    format's markers)."""
+    """Every block in `source`, covering the whole file with no gaps or
+    overlaps -- markdown headings, TOML/INI sections, or YAML top-level
+    keys when the format has one; tag-nesting-aware blocks for HTML;
+    blank-line paragraphs otherwise (also the fallback if a file has none
+    of its own format's markers)."""
     lines = source.splitlines()
     if not lines:
         return []
@@ -176,12 +166,10 @@ def index_text_blocks(source: str, language: Optional[str]) -> List[SymbolInfo]:
 
 def _name_match_ranking(blocks: List[SymbolInfo], user_request: str) -> List[tuple]:
     """Literal-name + word-overlap scoring, same technique
-    locator.locate_candidates already uses for functions (simplified:
-    blocks have no enclosing-class concept to corroborate against).
-    Returns [(score, block), ...] in descending-score order -- the
-    scored ranking itself, not just the winner, so it can decide "tied,
-    ambiguous" on its own or be fused with BM25/vector rankings exactly
-    like a symbol ranking is."""
+    locator.locate_candidates uses for functions (simplified: blocks have
+    no enclosing-class concept). Returns [(score, block), ...] in
+    descending order so the caller can detect ties or fuse with
+    BM25/vector rankings."""
     request_lower = user_request.lower()
     request_words = _words(user_request)
     scored = []
@@ -197,12 +185,11 @@ def _name_match_ranking(blocks: List[SymbolInfo], user_request: str) -> List[tup
 
 
 def _body_match_ranking(blocks: List[SymbolInfo], source: str, user_request: str) -> List[tuple]:
-    """Same technique analyzer.locator.locate_candidates_by_body uses for
-    functions: a request word that never appears in any block's NAME
-    (heading/tag) can still appear inside its body -- an HTML <script>
-    or <style> block especially, whose "name" is just "script"/"style",
-    never whatever identifier the request actually names. Returns
-    [(score, block), ...], same shape as _name_match_ranking."""
+    """Same technique locate_candidates_by_body uses for functions: a
+    request word absent from a block's NAME can still be in its body --
+    e.g. an HTML <script>/<style> block, whose name is just
+    "script"/"style". Returns [(score, block), ...], same shape as
+    _name_match_ranking."""
     target_words = {w for w in _words(user_request) - _GENERIC_LEADING_VERBS - _GENERIC_TYPE_WORDS if len(w) >= 3}
     if not target_words:
         return []
@@ -218,23 +205,16 @@ def _body_match_ranking(blocks: List[SymbolInfo], source: str, user_request: str
 
 
 def locate_text_blocks(source: str, user_request: str, language: Optional[str]) -> List[SymbolInfo]:
-    """Every block whose name OR body content confidently relates to the
-    request -- not just the single best match locate_text_block commits
-    to. Real gap this closes: a rename that spans a markup block and its
-    own inline <script> (an id used both in a tag's attribute and in the
-    JS that references it) genuinely needs BOTH blocks touched in one
-    edit -- "which one was meant" doesn't apply, since neither alone is
-    a complete, correct change. locate_text_block's own single-best
-    design would see this as a tie and refuse.
+    """Every block whose name OR body relates to the request -- not just
+    the single best match locate_text_block commits to. Needed when an
+    edit genuinely spans two blocks (e.g. a rename touching both a markup
+    tag's id and its inline <script> reference), which locate_text_block
+    would otherwise see as a tie and refuse.
 
-    Returns [] when nothing scores at all (never a guess when there's no
-    real signal); returns every scoring block otherwise, ranked highest
-    first -- the caller decides what to do with one vs. several (a
-    single-block edit, same as before, or a combined multi-block one).
-    A block that scored only because it shares a request word but isn't
-    actually relevant costs nothing extra: the multi-block prompt
-    already instructs the model to leave an unrelated block's content
-    byte-identical, same as any other unaffected region."""
+    Returns [] when nothing scores; otherwise every scoring block, ranked
+    highest first -- caller decides single- vs multi-block edit. A block
+    that scores only incidentally costs nothing extra: the multi-block
+    prompt tells the model to leave unrelated blocks byte-identical."""
     blocks = index_text_blocks(source, language)
     if len(blocks) < 2:
         return []
@@ -247,13 +227,10 @@ def locate_text_blocks(source: str, user_request: str, language: Optional[str]) 
 
 
 def _to_repo_symbols(blocks: List[SymbolInfo], source: str) -> List[RepoSymbol]:
-    """Same RepoSymbol adapter context_builder.py's own _to_repo_symbols
-    uses for function/class symbols, here for blocks -- BM25Retriever/
-    VectorRetriever/fuse are duck-typed (.file/.name/.symbol_type/
-    .start_line/.end_line/.docstring_first_line/.source/.language),
-    so the exact same retrieval machinery `iee find`'s repo-wide search
-    and context_builder's per-file symbol search both already use
-    applies to a text block just as well as it does to a function."""
+    """Same RepoSymbol adapter context_builder.py uses for function/class
+    symbols, here for blocks -- BM25Retriever/VectorRetriever/fuse are
+    duck-typed, so the same retrieval machinery applies to a text block
+    just as well as a function."""
     lines = source.splitlines()
     return [
         RepoSymbol(
@@ -272,10 +249,8 @@ def _to_repo_symbols(blocks: List[SymbolInfo], source: str) -> List[RepoSymbol]:
 
 def _safe_vector_rank(repo_blocks: List[RepoSymbol], user_request: str, top_k: int) -> list:
     """Vector retrieval is one signal among several -- a failure here
-    (embeddings gateway cold-starting, a network blip) degrades to
-    "this signal didn't fire" rather than failing the whole locate
-    call, same reasoning context_builder.py's own _safe_vector_rank and
-    retrieval/locate_repo.py's _safe_vector_ranking both already apply."""
+    degrades to "signal didn't fire" rather than failing the whole
+    locate call, same as context_builder.py's _safe_vector_rank."""
     try:
         return VectorRetriever(repo_blocks).rank(user_request, top_k=top_k)
     except Exception:
@@ -285,21 +260,16 @@ def _safe_vector_rank(repo_blocks: List[RepoSymbol], user_request: str, top_k: i
 def locate_text_block(
     source: str, user_request: str, language: Optional[str], use_hybrid: bool = False
 ) -> Optional[SymbolInfo]:
-    """The single best-matching block for a request, or None when
-    nothing scores confidently (including a tie). Returns at most one:
-    unlike function localization (which can show several matches as
-    extra, cheap context), a block edit commits to regenerating exactly
-    the one block returned here -- an ambiguous match must fall through
-    to a whole-file edit instead of guessing which section was meant.
+    """The single best-matching block for a request, or None when nothing
+    scores confidently (including a tie). Returns at most one: a block
+    edit commits to regenerating exactly the block returned, so an
+    ambiguous match must fall through to a whole-file edit rather than
+    guess.
 
-    `use_hybrid=True` fuses the name/word-overlap ranking above with
-    BM25 keyword and vector/semantic retrieval over every block in the
-    file -- the same reasoning context_builder._hybrid_rerank already
-    applies to functions: a request sharing only rare body words, or a
-    paraphrase, with the right section is exactly what those two
-    signals catch that name matching alone misses. Real per-call cost
-    callers should know about: vector retrieval is a real embeddings-API
-    call, not free like the fast paths elsewhere in this project."""
+    `use_hybrid=True` fuses the name/word-overlap ranking with BM25 and
+    vector/semantic retrieval over every block in the file, same
+    reasoning as context_builder._hybrid_rerank for functions. Note:
+    vector retrieval is a real embeddings-API call, not free."""
     blocks = index_text_blocks(source, language)
     if len(blocks) < 2:
         return None
@@ -335,26 +305,14 @@ def locate_text_block(
 def block_context_window(source: str, block: SymbolInfo, n: int = 2) -> tuple:
     """A few lines immediately outside `block`'s own range, read-only
     context for generation -- NOT part of what gets regenerated or
-    spliced back (the block's own start_line/end_line stay exact, same
-    non-overlapping boundaries index_text_blocks always produces).
+    spliced back (block boundaries stay exact). Lets a boundary-sensitive
+    edit ("match the tone above") see neighboring content without
+    expanding what gets rewritten; standard RAG chunk-overlap technique,
+    since a block has no name-line shorthand the way a function signature
+    gives code-symbol context.
 
-    Real gap this closes: generate_block_replacement previously showed
-    the model the target block in total isolation, with no visibility
-    into how the section just above or below it actually reads -- so a
-    boundary-sensitive edit ("match the tone of the section above",
-    "add a blank line consistent with the rest of the file") had
-    nothing to go on. Standard RAG chunk-overlap technique: chunks are
-    indexed and edited with crisp, non-overlapping boundaries, but nearby
-    chunks still overlap into the context window shown at generation
-    time. Code-symbol context (context_builder.py) already gets this for
-    free via its compact "other symbols in this file" name line; text
-    blocks had no equivalent, since a block has no name-line shorthand
-    the way a function signature does.
-
-    Bounded by neighboring content only, not a fixed line count that
-    could bleed past it: harmless if it includes part of a
-    block-before-that when a neighbor is shorter than `n` lines, never
-    crosses out of the file's own line range."""
+    Bounded by neighboring content only, never crosses the file's own
+    line range."""
     lines = source.splitlines()
     before_start = max(block.start_line - 1 - n, 0)
     before = "\n".join(lines[before_start : block.start_line - 1])

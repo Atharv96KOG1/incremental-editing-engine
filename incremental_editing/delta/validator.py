@@ -14,31 +14,19 @@ class DeltaValidationError(Exception):
 
 class UnseenReplaceTargetError(DeltaValidationError):
     """A REPLACE named a real symbol, but its body was never shown to the
-    model -- only its bare name, via the compact-context fallback.
-    Distinct from a generic DeltaValidationError so run_pipeline.py can
-    react to it specifically: force a direct escalation to whole-file
-    regeneration (which sends the real content) instead of retrying the
-    same limited context through the normal repair loop and hoping the
-    model chooses to escalate on its own -- observed not to, reporting a
-    safe but unhelpful no-op instead of actually satisfying the request."""
+    model (only its bare name). Distinct from DeltaValidationError so
+    run_pipeline.py can force escalation to whole-file regeneration
+    instead of retrying through the repair loop, which the model doesn't
+    reliably self-correct from."""
 
 
 def _check_decorators_preserved(source: str, sym, new_content: str, symbol_name: str) -> None:
-    """A REPLACE must restate a symbol's *complete* body, decorators
-    included -- real regression this caught live: a REPLACE for a Flask
-    route handler dropped its own '@app.route(...)' decorator, which the
-    apply engine then spliced right over (find_symbol's start_line
-    already includes decorator lines, by design, so the model was shown
-    them), silently un-registering that route -- the file still parsed
-    fine and nothing else failed, so nothing surfaced the loss until the
-    endpoint itself was hit and 404'd.
-
-    Checked structurally against the ORIGINAL symbol's own real source
-    lines, not by re-running the app or guessing what a missing
-    decorator does. `@`-prefixed lines generalize past Python (Java/
-    Kotlin annotations and TypeScript decorators use the same syntax),
-    so this isn't Python-only despite most real hits being Flask
-    routes."""
+    """A REPLACE must restate a symbol's complete body including
+    decorators -- a model once dropped a Flask route's '@app.route(...)'
+    decorator in a REPLACE, silently un-registering the route with no
+    parse error to catch it. Checked against the original symbol's real
+    source lines. `@`-prefixed lines also cover Java/Kotlin annotations
+    and TypeScript decorators, not just Python."""
     original_lines = source.splitlines()[sym.start_line - 1 : sym.end_line]
     original_decorators = [line.strip() for line in original_lines if line.strip().startswith("@")]
     if not original_decorators:
@@ -67,38 +55,16 @@ def validate_targets(
     prefer_lines: Optional[Dict[str, int]] = None,
     content_shown_for: Optional[set] = None,
 ) -> None:
-    """Confirm every REPLACE/DELETE target and INSERT anchor actually exists in source,
-    exactly once -- a name defined more than once is refused, not guessed at, UNLESS
-    `prefer_lines` (name -> start_line) already resolved which occurrence is meant
-    (locate_candidates does this via class-name mention or a semantic tiebreak when a
-    bare name is duplicated, e.g. the same method repeated across classes).
-
-    Also refuses an INSERT whose own content would create a *second*
-    definition of a name that already exists elsewhere in the file --
-    real corruption this caught retroactively: a class-method version of
-    a function inserted (as part of a broader refactor) alongside an old
-    top-level one that was never removed, both silently coexisting until
-    something later tried to REPLACE/DELETE that name and hit an
-    unresolvable "defined N times" error with no way to tell which one
-    was meant. The model's own declared symbol_name is never trusted for
-    this -- defined_symbol_name looks at what `content` actually
-    defines, the same way api/run_pipeline.py corrects a mismatched
-    *displayed* INSERT name.
-
-    `content_shown_for` -- when given, the set of symbol names whose
-    *full body* was actually included in the model's context (i.e.
-    context_builder.py's candidate_symbols, not the bare compact name
-    list every other symbol only gets a name for) -- refuses a REPLACE
-    on any name outside it. Real data loss this caught: a request that
-    matched no localized candidate fell back to the compact context
-    (imports + bare names, no bodies), and the model still emitted a
-    REPLACE for one of those bare names -- since REPLACE's content must
-    be the *complete* new body, and the model had never seen the real
-    one, it fabricated an entirely different, much smaller function,
-    silently dropping real content (an extra table, half the original
-    columns) it was never shown in the first place. DELETE and INSERT
-    are exempt: DELETE needs no content, and INSERT's content is new by
-    definition, not a rewrite of something unseen."""
+    """Confirms every REPLACE/DELETE target and INSERT anchor exists in
+    source exactly once; an ambiguous name is refused unless
+    `prefer_lines` already resolved which occurrence is meant. Also
+    refuses an INSERT whose content would create a duplicate definition
+    of an existing name (caught a real case of two methods silently
+    coexisting undetected). `content_shown_for`, when given, is the set
+    of symbol names whose full body was actually shown to the model --
+    REPLACE on a name outside it is refused, since the model would
+    otherwise fabricate/drop content for a symbol it never saw. DELETE
+    and INSERT are exempt (no prior content to compare against)."""
     symbols = index_symbols(source, language)
     prefer_lines = prefer_lines or {}
     for op in delta.operations:

@@ -1,26 +1,16 @@
 """Static, zero-LLM-call code metadata -- one JSON artifact per project,
-covering every function/class in every indexed file: name, type, exact
-line span, parameters, decorators, return-type hint, async-ness, a
-keyword set, how many other symbols call it, what it calls, and a content
-hash. Nothing here ever asks a model anything; it's pure AST/Tree-sitter
-extraction, the same techniques already used throughout `analyzer/` and
-`retrieval/`, just persisted as one artifact instead of recomputed ad hoc
-inside each of locate_candidates/build_context/build_call_graph.
+covering every function/class in every indexed file: name, type, line
+span, parameters, decorators, return-type hint, async-ness, keywords,
+call-graph edges, and a content hash. Pure AST/Tree-sitter extraction,
+persisted as one artifact instead of recomputed ad hoc elsewhere.
 
-Why this exists: the compact "other symbols" line the LLM sees today
-(context_builder.py) shows bare names only -- "divide", not "divide(a,
-b)". A request naming a parameter or a framework decorator ("the route
-handler for /login") has nothing to match against. Pulling parameters and
-decorators into that same line costs a handful of tokens and gives real
-disambiguating signal, without ever sending a full body. That's the
-token-cost tradeoff this whole project has been built around, applied to
-one more input.
+Exists so context_builder's compact "other symbols" line can show
+parameters/decorators, not just bare names -- real disambiguating signal
+for a few extra tokens, without sending a full body.
 
-Persisted in one visible, browsable folder (~/iee-metadata/), one file
-per project named after that project's own folder -- not a dot-prefixed
-cache directory like Joern's, since this is meant to be looked at
-directly. Fingerprinted the same way repo_index's own cache is: unchanged
-files reuse the prior metadata instead of re-parsing on every call.
+Persisted in one visible, browsable folder (~/iee-metadata/), one file per
+project, fingerprinted like repo_index's own cache so unchanged files
+reuse prior metadata instead of re-parsing.
 """
 
 import ast
@@ -141,21 +131,15 @@ def _index_python_metadata(source: str, lines: List[str]) -> List[SymbolMetadata
 
 def extract_symbol_metadata(source: str, language: Optional[str]) -> List[SymbolMetadata]:
     """Single-file entry point -- no project_dir, no disk cache, no
-    call-graph merge (that needs the whole repo indexed first, see
+    call-graph merge (that needs the whole repo indexed, see
     build_project_metadata). Same per-symbol fields except calls/
-    called_by_count (always empty/0 here). Costs the same one AST/
-    Tree-sitter parse `index_symbols()` already pays per call; this
-    reads a couple more fields off the same parse, not a second one.
+    called_by_count (always empty/0 here).
 
-    Falls back to block-level metadata (see _index_text_block_metadata)
-    whenever symbol extraction finds nothing at all -- either because
-    this language has no function/class concept to begin with (markdown,
-    TOML, YAML, HTML, Dockerfile, plain text, ...) or this particular
-    file just happens to have none. Real gap this closes: metadata was
-    silently empty for an entire class of real files -- the same files
-    analyzer/text_blocks.py already knows how to localize into real,
-    addressable regions for editing, just never reflected in the
-    persisted metadata describing them."""
+    Falls back to block-level metadata (_index_text_block_metadata) when
+    symbol extraction finds nothing -- either the language has no
+    function/class concept (markdown, TOML, YAML, HTML, Dockerfile, plain
+    text, ...) or this file just has none, so metadata isn't silently
+    empty for files text_blocks.py can still localize into."""
     lines = source.splitlines()
     symbols: List[SymbolMetadata] = []
     if language == "python":
@@ -172,11 +156,10 @@ def extract_symbol_metadata(source: str, language: Optional[str]) -> List[Symbol
 
 
 def _index_text_block_metadata(source: str, lines: List[str], language: Optional[str]) -> List[SymbolMetadata]:
-    """Block-level metadata (a markdown heading, a TOML/INI section, a
-    YAML top-level key, an HTML tag, or a blank-line paragraph) for a
-    file with no function/class-level metadata at all -- same generic
-    locator analyzer/text_blocks.py already uses for localization,
-    reused directly here rather than a second, format-specific pass."""
+    """Block-level metadata (markdown heading, TOML/INI section, YAML
+    top-level key, HTML tag, or blank-line paragraph) for a file with no
+    function/class metadata -- reuses text_blocks.py's locator rather
+    than a second, format-specific pass."""
     try:
         blocks = index_text_blocks(source, language)
     except Exception:
@@ -200,14 +183,11 @@ def _index_text_block_metadata(source: str, lines: List[str], language: Optional
 
 
 def _index_multilang_metadata(source: str, lines: List[str], language: str) -> List[SymbolMetadata]:
-    """Non-Python languages get the fields cheaply available from the
-    generic Tree-sitter extraction already used elsewhere in this
-    project (name, type, line span, keywords, content hash) -- not
-    parameters/decorators/return-type/async-ness, which would need a
-    per-language grammar query rather than the generic node-type-name
-    heuristic this project deliberately uses for breadth over depth
-    (same honest limitation as docstring_first_line/parent_class being
-    Python-only elsewhere in analyzer/locator.py)."""
+    """Non-Python languages get only the fields cheap from generic
+    Tree-sitter extraction (name, type, line span, keywords, content
+    hash) -- parameters/decorators/return-type/async-ness would need a
+    per-language grammar query, same Python-only limitation as
+    docstring_first_line/parent_class in analyzer/locator.py."""
     out: List[SymbolMetadata] = []
     for raw in extract_symbols(source, language):
         snippet = "\n".join(lines[raw.start_line - 1 : raw.end_line])
@@ -338,11 +318,10 @@ def metadata_cache_path(project_dir: str) -> str:
 
 
 def _detect_language(rel_path: str, source: str) -> Optional[str]:
-    """Same detection order run_pipeline.run_edit already applies before
-    validate_targets/index_symbols -- kept in one place here too so every
-    commit site (edit, create, whole-file rewrite, language conversion,
-    multi-file create) gets identical, consistent per-file metadata
-    without repeating this three-line rule at each call site."""
+    """Same detection order run_pipeline.run_edit applies before
+    validate_targets/index_symbols -- centralized here so every commit
+    site (edit, create, rewrite, conversion, multi-file create) gets
+    consistent per-file metadata."""
     if rel_path.endswith(".py"):
         return "python"
     language = detect_language(rel_path)
@@ -359,27 +338,18 @@ def per_file_metadata_path(project_dir: str, rel_path: str) -> str:
 
 
 def write_file_metadata(project_dir: str, rel_path: str, source: str) -> Optional[str]:
-    """Regenerates and writes *this one file's* own metadata JSON --
-    called at every real commit point (STRUCTURED_EDIT, whole-file
-    rewrite, language conversion's new file, create, multi-file create)
-    right after the file's real content is written to disk, so
-    <project_dir>/iee_metadata/ always reflects what's actually there
-    right now, never a stale prior version.
+    """Regenerates and writes this one file's own metadata JSON, called
+    at every real commit point (edit, rewrite, conversion, create) right
+    after the file's content hits disk, so iee_metadata/ never goes
+    stale.
 
-    Every symbol entry carries what a human (or the LLM's own
-    localization step) needs to find it again exactly: name, start_line,
-    end_line, the real "block" (the exact source lines that span it,
-    not just a name), and a keyword index (tokenized name + first
-    docstring line) -- the same fields build_project_metadata already
-    computes for the whole-project snapshot, just persisted per file
-    instead of buried inside one combined document, and refreshed on
-    every edit instead of only on an explicit `iee metadata` call.
+    Each symbol entry carries name, start_line, end_line, the exact
+    source "block", and a keyword index -- persisted per file instead of
+    buried in one combined document, refreshed on every edit.
 
-    Returns None (writes nothing) only when there's truly nothing to
-    index at all (an empty file) -- an unrecognized extension no longer
-    means "no symbols," since extract_symbol_metadata's own block-level
-    fallback (a Dockerfile/.env's blank-line paragraphs, for instance)
-    still finds real, addressable regions even with language=None."""
+    Returns None only when there's truly nothing to index (empty file);
+    an unrecognized extension still gets block-level metadata via
+    extract_symbol_metadata's fallback."""
     language = _detect_language(rel_path, source)
     lines = source.splitlines()
     symbols = extract_symbol_metadata(source, language)

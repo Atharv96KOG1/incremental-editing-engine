@@ -16,35 +16,16 @@ _VALIDATION_COPY_IGNORE_NAMES = (
 
 
 def copy_project_for_validation(project_dir: str, tmp_project: str) -> None:
-    """The one isolated-copy operation every syntax/import/test
-    validation step already needed before this existed (each via its own
-    bare shutil.copytree) -- now skipping directories no real project's
-    test suite ever actually needs. Real cost this closes: pointing a
-    project directory at a large repo (this engine's own repo included)
-    made every single validation step copy gigabytes of .git history,
-    tool caches, and a whole separate virtualenv byte-for-byte before
-    ever running a single test -- the dominant cost behind "syntax and
-    test validation takes too long" for anything but a tiny project.
-
-    Also skips any directory a project's own `.ieeignore` names (same
-    file repo-wide retrieval's own iter_source_files already reads) --
-    an unrelated demo/scratch folder living alongside the real project
-    shouldn't be walked for tests any more than it should be indexed for
-    retrieval."""
+    """Skips .git/caches/venvs and any `.ieeignore`-named dirs, so copying a large
+    repo for validation doesn't copy gigabytes of unrelated history/tooling."""
     extra = project_ignore_dirs(project_dir)
     ignore = shutil.ignore_patterns(*_VALIDATION_COPY_IGNORE_NAMES, *extra)
     shutil.copytree(project_dir, tmp_project, ignore=ignore)
 
 
 def run_tests(test_target: str, cwd: str, timeout: float = 120) -> dict:
-    """Real bug this closes: a slow or genuinely hung test suite (a huge
-    project directory that collects far more than intended, a test with
-    a real infinite loop or a hung network call) previously crashed the
-    *entire* run with an uncaught subprocess.TimeoutExpired -- no
-    "failed" result, no error message, a raw Python traceback instead.
-    Every other external call in this project degrades to a controlled
-    failure instead of crashing (a broken Jev/vector/Aider call, a
-    hung embeddings request) -- this was the one place that didn't."""
+    """Catches subprocess.TimeoutExpired so a hung test suite degrades to a
+    controlled failure instead of crashing the whole run with a raw traceback."""
     try:
         proc = subprocess.run(
             [sys.executable, "-m", "pytest", test_target, "-q"],

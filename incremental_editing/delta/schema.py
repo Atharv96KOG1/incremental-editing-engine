@@ -63,15 +63,10 @@ DELTA_JSON_SCHEMA = {
 
 
 def _bare_name(name: Optional[str]) -> Optional[str]:
-    """Strips a call-signature suffix a model sometimes echoes verbatim
-    from the "other symbols" context line (context_builder.py renders a
-    zero-arg function as e.g. "load_api_key()", and a real generation has
-    been observed copying that whole string as symbol_name instead of
-    just "load_api_key", failing REPLACE/DELETE lookup and then repeating
-    the identical mistake across every repair attempt since nothing told
-    it what was actually wrong). No identifier in any language this
-    project targets can contain "(", so truncating at the first one is
-    always safe and a no-op for an already-bare name."""
+    """Strips a call-signature suffix (e.g. "load_api_key()") a model
+    sometimes echoes verbatim from the context line instead of the bare
+    name, which would otherwise fail REPLACE/DELETE lookup. No identifier
+    contains "(", so truncating at the first one is always safe."""
     if not name:
         return name
     return name.split("(", 1)[0].strip()

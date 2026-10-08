@@ -1,15 +1,7 @@
-"""Native call graph -- calls/called_by across the whole repo (PHOENIX doc
-section 1's "Dependency Index" / section 26's dependency graph), built with
-Python's own `ast` module for Python symbols instead of Joern/CPG, and
-Tree-sitter (`multilang_symbols.extract_called_names`) for every other
-language `repo_index.py` indexes.
-
-Name-based resolution only: a call `foo(...)` or `self.foo(...)` links to
-every indexed symbol named `foo`, with no cross-module import resolution.
-That's a real, stated limitation -- two unrelated `foo` functions in
-different files (or languages) look identical here. Good enough to answer
-"what else might this change affect" as a warning, not as a correctness
-guarantee.
+"""Native call graph (calls/called_by) across the repo, via `ast` for Python
+and Tree-sitter for other languages. Name-based resolution only, no
+cross-module import resolution -- two unrelated same-named functions look
+identical here. Good enough as a warning, not a correctness guarantee.
 """
 
 import ast

@@ -1,6 +1,5 @@
-"""Risk classification (PHOENIX doc section 20): LOW / MEDIUM / HIGH.
-Heuristic, not learned -- keyword and structural signals only, used to
-decide how much validation a change should require before it's trusted.
+"""Risk classification: LOW / MEDIUM / HIGH. Heuristic (keyword/structural
+signals), not learned -- decides how much validation a change needs.
 """
 
 import re

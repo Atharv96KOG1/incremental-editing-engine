@@ -23,13 +23,11 @@ console = Console()
 
 
 class StepTracker:
-    """Renders pipeline steps as a tagged checklist that grows in place: each
-    line is stamped with which pipeline phase it's from (LOCALIZE, GENERATE,
-    VALIDATE, APPLY, TEST, SYNTAX, REPAIR, COMMIT), the in-progress step shows a
-    spinner glyph, every step before it shows a checkmark, and the whole
-    list stays in the terminal's scrollback -- nothing gets overwritten or
-    disappears once printed. The tags let someone unfamiliar with the code
-    map each line to a phase of the pipeline without reading the source."""
+    """Renders pipeline steps as a tagged checklist that grows in place:
+    each line stamped with its pipeline phase (LOCALIZE, GENERATE,
+    VALIDATE, APPLY, TEST, SYNTAX, REPAIR, COMMIT), spinner on the
+    in-progress step, checkmarks before it, whole list kept in
+    scrollback -- nothing overwritten or erased."""
 
     _SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
     _TAG_COLORS = {
@@ -165,13 +163,10 @@ def cmd_create(args: argparse.Namespace) -> None:
 
 
 def _resolve_file(args: argparse.Namespace) -> str:
-    """If --file was omitted, use hybrid retrieval across the whole
-    project to find it (PHOENIX doc sections 1/4) instead of requiring
-    the caller to already know which file the request is about.
-
-    Uses the fast path (symbol+BM25 only, no semgrep, no dependency
-    graph) -- `iee find` is where the full evidence-gathering pipeline
-    belongs; picking the edit target just needs the file, fast."""
+    """If --file was omitted, uses hybrid retrieval across the project to
+    find it instead of requiring the caller to already know the file.
+    Uses the fast path (symbol+BM25 only, no semgrep/dependency graph) --
+    `iee find` is where the full evidence-gathering pipeline belongs."""
     if args.file:
         return args.file
 

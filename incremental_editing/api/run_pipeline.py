@@ -1,38 +1,23 @@
-"""EDIT path, now with bounded self-repair:
+"""EDIT path, with bounded self-repair:
 
 Python file -> user request -> localized context -> GPT-5.4 -> Structured
 Delta -> Validate -> Apply -> pytest -> (on failure: classify, repair,
 retry, bounded) -> store original + delta + new version in MinIO ->
 record tokens/cost/latency.
 
-Self-repair (PHOENIX architecture doc, section 18): a failure is
-classified into one of a small set of classes, then a repair prompt is
-built containing the previous (failed) Delta IR plus the exact error, and
-the model gets a bounded number of targeted retries -- never an
-unbounded loop. If the budget runs out, the run is reported failed;
-STRUCTURED_EDIT itself still never falls back to full regeneration
-mid-repair (that's a separate, larger piece).
+Self-repair (PHOENIX doc, section 18): failure classified into a fixed
+set of classes, repair prompt built from the failed Delta IR + exact
+error, bounded retries only -- never unbounded, and STRUCTURED_EDIT
+never falls back to full regeneration mid-repair.
 
-What routes to FULL_REGENERATION instead is decided by the *model*, not a
-hand-written keyword/language list here: a file-wide structural/hygiene
-request (comments, whitespace, docstrings, formatting -- reaching
-content outside any single symbol's own span) or a request for a
-different programming language entirely are both things no
-REPLACE/INSERT/DELETE on a named symbol could ever satisfy, so there's
-nothing a repair loop could fix either way -- it needs the whole file as
-both input and output from the start. generate_delta's normal call
-(same compact context, no extra round-trip) can return
-{"operations":[],"escalate":{"kind":"whole_file"}} or {"kind":
-"language_conversion","target_language":...,"target_extension":...}
-instead of guessing -- see structured_edit.py's prompt. A hand-rolled
-regex/keyword classifier for this used to live here and in
-analyzer/locator.py; it kept needing a new case for every new phrasing
-and could never cover "every language," which the model already
-understands natively.
+Routing to FULL_REGENERATION is decided by the model itself via
+generate_delta's escalate field ({"kind":"whole_file"} /
+"language_conversion"/...), not a hand-written keyword/language
+classifier -- those can't express "reaches outside any symbol's span"
+or cover every language.
 
 `run_edit` is the callback-driven core (no printing, no sys.exit) so both
-the plain CLI below and `incremental_editing/cli.py` (the rich-formatted
-CLI) can drive it.
+the plain CLI below and `incremental_editing/cli.py` can drive it.
 """
 
 import argparse
@@ -105,13 +90,10 @@ def _project_dir_is_this_engine(project_dir: Path) -> bool:
 
 
 def _discover_relevant_test_target(project_dir: Path, file: str) -> Optional[str]:
-    """A real, already-existing test file that's actually about `file` --
-    never invented, only discovered via the same naming convention
-    virtually every test suite already uses: test_<name>.<ext> or
-    <name>_test.<ext>, either co-located with the source file or under a
-    sibling/ancestor `tests/` directory mirroring its own path. Returns
-    the narrowest real match found, or None when nothing like that
-    exists at all -- the caller decides what "nothing found" means."""
+    """Finds an existing test file actually about `file` via the standard
+    naming convention (test_<name>.<ext> / <name>_test.<ext>, co-located
+    or under a tests/ dir) -- never invents one. Returns the narrowest
+    match, or None."""
     rel = Path(file)
     stem = rel.stem
     candidates = [
@@ -129,24 +111,12 @@ def _discover_relevant_test_target(project_dir: Path, file: str) -> Optional[str
 
 
 def _effective_test_target(test_target: str, project_dir: Path, file: str) -> str:
-    """Real bug this closes: `test_target` left at its default (".") --
-    the whole project directory -- previously meant every edit's own
-    validation ran pytest against EVERYTHING under project_dir,
-    including entirely unrelated content (other subprojects, scratch
-    folders, this engine's own repo) that happens to sit alongside the
-    real target. Real, observed case: editing `cores/newchatbot.py`
-    with project_dir pointed at a large, cluttered directory made
-    validation pytest '.' the whole thing, timing out after 120s on
-    unrelated tests that were never going to pass or fail because of
-    this change either way.
-
-    An explicit, narrower test_target the caller already chose is never
-    touched here -- only the broad default gets a chance to narrow
-    itself, and only ever down to something real: a discovered test
-    file actually about this change (see _discover_relevant_test_target),
-    or failing that, this file's own containing directory -- narrower
-    than the whole project root, but never invented; "no tests
-    collected" there is a legitimate pass, not a guess."""
+    """Narrows the default test_target (".") so validation doesn't pytest
+    the whole project dir (unrelated subprojects, this engine's own repo)
+    and time out on content the edit never touched. An explicit, already-
+    narrower test_target is left untouched; the default narrows only to a
+    discovered test file (_discover_relevant_test_target) or, failing
+    that, `file`'s own containing directory."""
     if test_target != ".":
         return test_target
     discovered = _discover_relevant_test_target(project_dir, file)
@@ -157,14 +127,12 @@ def _effective_test_target(test_target: str, project_dir: Path, file: str) -> st
 
 
 class _TestFailure(Exception):
-    """Internal signal only -- lets a failing pytest run join the same
-    classify-and-repair path as the other failure exceptions below,
-    instead of needing its own separate branch."""
+    """Internal signal so a failing pytest run joins the same classify-
+    and-repair path as the other failure exceptions below."""
 
 
 def _classify_failure(e: Exception) -> str:
-    """Maps our concrete exceptions onto PHOENIX's failure-class taxonomy
-    (section 18) -- a fixed set of strings, not a learned classifier."""
+    """Maps exceptions onto PHOENIX's failure-class taxonomy (section 18)."""
     if isinstance(e, SyntaxCheckError):
         return "SYNTAX_ERROR"
     if isinstance(e, ApplyError):
@@ -183,21 +151,13 @@ _COLLECTION_ERROR_RE = re.compile(r"ERROR collecting (\S+)")
 
 
 def _unrelated_collection_error_file(failure_detail: str, file: str) -> Optional[str]:
-    """The path pytest failed to even COLLECT (a real ImportError/
-    SyntaxError inside that file itself, before a single test ever ran),
-    or None if this failure isn't a collection error at all -- or if the
-    collected path IS the file just edited (then the edit itself might
-    really be the cause, and repair is still worth trying).
-
-    Real waste this closes: a collection error in some OTHER, unrelated
-    file (a stale/broken test elsewhere in a too-broadly-scoped
-    test_target -- observed live: test_target='.' picking up an
-    unrelated sample_project/test_calculator.py with its own pre-existing
-    ModuleNotFoundError) can never be caused by, or fixed by correcting,
-    a delta applied to a completely different file. Retrying repeats the
-    identical collection error every time, for real cost -- three bounded
-    repair attempts, each a full LLM call, burned on something no
-    correction to `file` could ever touch."""
+    """Returns the path pytest failed to COLLECT, or None if this isn't a
+    collection error or the collected path IS the edited file (then the
+    edit itself may be the cause, repair still worth trying). A collection
+    error in some OTHER file (e.g. an unrelated stale test picked up by a
+    too-broad test_target) can't be fixed by repairing a delta to `file`,
+    so retrying would just repeat the same error across all repair
+    attempts for nothing."""
     m = _COLLECTION_ERROR_RE.search(failure_detail)
     if not m:
         return None
@@ -208,10 +168,9 @@ def _unrelated_collection_error_file(failure_detail: str, file: str) -> Optional
 
 
 def _first_defined_name(content: Optional[str]) -> Optional[str]:
-    """Python-only convenience wrapper -- see analyzer.locator.defined_symbol_name
-    (the shared, multi-language implementation this now delegates to;
-    kept here under its original name since it's part of this module's
-    tested surface)."""
+    """Python-only wrapper around analyzer.locator.defined_symbol_name,
+    kept under its original name since it's part of this module's tested
+    surface."""
     return defined_symbol_name(content, "python")
 
 
@@ -224,21 +183,11 @@ def _change_ratio(original: str, new: str) -> float:
 
 
 def _compact_created_file_summary(path: str, content: str) -> str:
-    """A structural summary (function/class signatures) of a just-created
-    file, for composing the also_link_current_file edit -- not its full
-    text. Real waste this closes: linking 4 substantial new files (a
-    real "make a chatbot with frontend/backend/storage/sessions"
-    request) re-sent all four files' *complete* content just to write
-    one import/usage edit in the current file, dominating that request's
-    input tokens. A signature list ("function chat(message)", "function
-    save_session(session_id, data)") gives the linking step everything
-    it actually needs to write correct calls, at a fraction of the cost.
-
-    Falls back to the real content for anything with no extractable
-    symbol structure -- a plain .env (KEY=VALUE lines, no functions at
-    all) or a binary artifact's base64 both need the real thing (env
-    keys must be named exactly right; a binary file has no symbols to
-    summarize in the first place, only "(binary file)")."""
+    """Structural summary (function/class signatures) of a just-created
+    file for the also_link_current_file edit, instead of resending its
+    full content -- keeps linking N new files cheap. Falls back to the
+    real content when there's no extractable symbol structure (.env
+    files need exact key names; binary files have no symbols at all)."""
     if is_binary_artifact_target(path):
         return "(binary file, already created)"
     language = "python" if path.endswith(".py") else detect_language(path)
@@ -259,12 +208,9 @@ def _persist_run(storage, project_id, run_id, delta_dict, metadata, attempt=None
 
 def _fold_prior_generation(metadata: dict, prior_gen: Optional[dict]) -> None:
     """Adds a prior LLM call's usage onto metadata["generation"]'s totals
-    -- specifically, the classification call that produced an escalate
-    signal (see generate_delta / structured_edit.py's prompt) before
-    _run_whole_file_edit/_run_language_conversion ever ran. That call
-    cost real tokens too; dropping it would undercount the run's real
-    cost. A no-op when there was no prior call (e.g. CREATE mode never
-    has one)."""
+    -- e.g. the classification call that produced an escalate signal
+    before this handler ran, so its real cost isn't dropped. No-op when
+    there was no prior call."""
     if not prior_gen:
         return
     g = metadata["generation"]
@@ -283,13 +229,11 @@ def _fold_prior_generation(metadata: dict, prior_gen: Optional[dict]) -> None:
 
 
 def _cross_file_rename_impact(project_dir: Path, current_file: str, symbol_names: List[str]) -> Optional[List[str]]:
-    """Real callers of any name in `symbol_names` OUTSIDE `current_file`,
-    per Joern's CPG -- exactly the blind spot rename_with_subword_
-    fallback has (it only ever rewrites occurrences inside the one file
-    it's given). None when Joern isn't installed, the repo has no
-    Joern-supported language present, or no external caller was found --
-    every one of those is "nothing to warn about," not an error; this
-    never raises and never blocks the rename itself."""
+    """Real callers of `symbol_names` OUTSIDE `current_file`, via Joern's
+    CPG -- covers the blind spot rename_with_subword_fallback has (it only
+    rewrites occurrences inside the one file it's given). None when Joern
+    is unavailable or finds nothing; never raises, never blocks the
+    rename."""
     from ..retrieval.joern_graph import build_call_graph_via_joern, is_available
     from ..retrieval.repo_index import build_repo_index
 
@@ -310,13 +254,10 @@ def _cross_file_rename_impact(project_dir: Path, current_file: str, symbol_names
 
 
 def _locate_import_span(source: str) -> Optional[tuple]:
-    """1-indexed (start_line, end_line) inclusive span covering every
-    top-level import statement in `source`, real AST node positions --
-    not a naive "lines starting with import/from" scan, so a stray
-    non-import line between two import groups is never swept into the
-    replaced region. None when the source doesn't parse (shouldn't
-    happen here -- check_syntax already ran first) or has no imports at
-    all (nothing for a narrow import-only fix to target)."""
+    """1-indexed (start_line, end_line) span covering every top-level
+    import statement, via real AST node positions -- not a naive "lines
+    starting with import" scan, so a stray non-import line between
+    import groups is never swept in. None if unparseable or no imports."""
     try:
         tree = ast.parse(source)
     except SyntaxError:
@@ -328,15 +269,11 @@ def _locate_import_span(source: str) -> Optional[tuple]:
 
 
 def _imported_names(import_block: str) -> set:
-    """Every local name an import block binds (its alias if aliased,
-    otherwise its own name) -- used to check a narrow import-only fix
-    doesn't silently orphan a name the rest of the file still uses (see
-    the fix's own comment at its call site). The OLD block passed at the
-    call site is always a real span _locate_import_span already found
-    inside an already-ast.parse'd file, so it always parses on its own
-    too; only the model's own NEW block could genuinely fail to parse --
-    that degrades to "no names," which only makes the orphan check
-    stricter (every old name looks orphaned), never looser."""
+    """Every local name an import block binds (alias if aliased, else its
+    own name) -- used to check a narrow import-only fix doesn't orphan a
+    name still used elsewhere. A block that fails to parse (only possible
+    for the model's generated replacement) degrades to "no names," which
+    only makes the orphan check stricter, never looser."""
     try:
         tree = ast.parse(import_block)
     except SyntaxError:
@@ -367,49 +304,29 @@ def _run_whole_file_edit(
     classification_gen: Optional[dict] = None,
     language: Optional[str] = None,
 ) -> dict:
-    """Whole-file regeneration for an EXISTING file's edit is refused
-    outright, by explicit policy: this pipeline only ever changes the
-    specific symbol(s) a request identifies, never the whole file --
-    even when the model itself recognizes (via generate_delta's escalate
-    signal) that a request reaches outside every symbol's own span (a
-    module docstring, a standalone module-level comment or statement,
-    blank-line formatting between functions). Note this is genuinely
-    narrower than "touches many symbols": the prompt itself now steers
-    the model to prefer several REPLACE ops over escalating here, since
-    each REPLACE already restates its own complete body regardless of
-    how many other symbols also change -- whole_file should only ever
-    reach this function for content no REPLACE/INSERT/DELETE could ever
-    target at all.
+    """Whole-file regeneration for an EXISTING file's edit is refused by
+    policy: this pipeline only ever changes the symbol(s) a request
+    identifies, even when the model's escalate signal says the request
+    reaches outside every symbol's own span (module docstring, standalone
+    module-level statement, inter-function formatting).
 
-    Before refusing, though, tries analyzer/module_blocks.py: content
-    outside every symbol's span is still very often just ONE small,
-    narrowly-locatable region (a module-level config list, an
-    `if __name__ == "__main__":` guard) -- real, confirmed case: "remove
-    gpt" against a file whose only "gpt" text lived inside a
-    module-level `MODEL_SLOTS = [...]` list (never inside any function/
-    class body) found zero symbol candidates and correctly escalated
-    here, but the actual edit needed was a 7-line region, not the whole
-    138-line file. Only an unlocatable/ambiguous region falls through to
-    the refusal below. Requires at least one real function/class symbol
-    elsewhere in the file: with zero symbols, the "gap" IS the whole
-    file, and locating "a" module-level block there is just a
-    whole-file rewrite wearing a narrower name -- exactly what this
-    refusal exists to prevent.
+    Before refusing, tries analyzer/module_blocks.py: that "outside any
+    symbol" content is often one small, narrowly-locatable region (a
+    module-level config list, an `if __name__ == "__main__":` guard), so
+    only an unlocatable/ambiguous region falls through to the refusal.
+    Requires at least one real function/class symbol elsewhere in the
+    file -- with zero symbols the "gap" is the whole file, so locating
+    "a" module-level block there would just be a whole-file rewrite by
+    another name.
 
-    CREATE (api/create_pipeline.py) and language_conversion
-    (_run_language_conversion, elsewhere in this file) are NOT affected
-    by this refusal and never call this function -- both structurally
-    have no existing symbol to target in the first place (a brand-new
-    file, or a rewrite into a different language), so whole-file
-    generation there isn't a fallback being chosen over something
-    smaller, it's the only mechanism that could ever apply. This
-    function is reached only when an EXISTING file's edit escalates past
-    REPLACE/INSERT/DELETE.
+    CREATE and language_conversion never call this function -- both have
+    no existing symbol to target in the first place, so whole-file
+    generation there is the only mechanism that could ever apply, not a
+    fallback from something smaller.
 
-    Zero additional generation cost for the refusal path: no full-file
-    call is made at all -- only whatever classification call already
-    ran (which is what discovered the escalation) is billed, folded in
-    via classification_gen for honest accounting."""
+    The refusal path makes no extra generation call: only the
+    classification call that discovered the escalation is billed, folded
+    in via classification_gen."""
     run_id = f"run-{uuid.uuid4().hex[:8]}"
 
     if language is not None and index_symbols(original_source, language):
@@ -495,14 +412,11 @@ def _run_module_block_edit(
     classification_gen: Optional[dict] = None,
 ) -> dict:
     """Same mechanism as _run_text_block_edit, applied to a module-level
-    region (analyzer/module_blocks.py) instead of a whole-file-format
-    section -- only that region goes in as context and comes back as
-    output, spliced into the file by line range afterward, the exact
-    same technique apply_delta's REPLACE already uses for a function.
+    region (analyzer/module_blocks.py): only that region goes in as
+    context and comes back as output, spliced in by line range.
 
-    `block` is the analyzer.locator.SymbolInfo (symbol_type=
-    "module_statement") locate_module_level_block already resolved --
-    the caller is expected to have already checked it's non-None."""
+    `block` is the SymbolInfo (symbol_type="module_statement")
+    locate_module_level_block already resolved and confirmed non-None."""
     run_id = f"run-{uuid.uuid4().hex[:8]}"
     on_step("GENERATE", f"regenerating only the '{block.name}' module-level region...")
 
@@ -637,24 +551,15 @@ def _run_text_block_edit(
     vm: VersionManager,
     target_file: Path,
 ) -> dict:
-    """LLM-free *locator*, real (small) generation call -- for a file
-    whose format has no function/class concept at all (markdown, YAML,
-    TOML, INI, Dockerfile, plain text, ...), analyzer/text_blocks.py
-    still finds the one relevant section (a heading, a [section], a
-    top-level key, or a blank-line-delimited paragraph) the same way
-    locate_candidates finds a function, so only THAT block -- not the
-    whole file -- goes in as context and comes back as output. Spliced
-    into the file by line range afterward, the exact same mechanical
-    technique apply_delta's REPLACE already uses for a function.
+    """For formats with no function/class concept (markdown, YAML, TOML,
+    INI, Dockerfile, plain text...), analyzer/text_blocks.py still finds
+    the one relevant section (heading, [section], top-level key, or
+    paragraph) so only that block -- not the whole file -- goes in as
+    context and comes back as output, spliced in by line range.
 
-    Real waste this avoids on top of already skipping STRUCTURED_EDIT's
-    classification call: "add retrieval types in the notes part" against
-    a 30-line README needs only its 3-line "### Notes" section as input
-    and output, not a full-file regeneration of all 30 lines.
-
-    `block` is the analyzer.locator.SymbolInfo (symbol_type="block")
-    text_blocks.locate_text_block already resolved -- the caller is
-    expected to have already checked it's non-None and unambiguous."""
+    `block` is the SymbolInfo (symbol_type="block")
+    text_blocks.locate_text_block already resolved and confirmed
+    non-None and unambiguous."""
     run_id = f"run-{uuid.uuid4().hex[:8]}"
     on_step("GENERATE", f"regenerating only the '{block.name}' block...")
 
@@ -784,20 +689,14 @@ def _run_multi_text_block_edit(
     vm: VersionManager,
     target_file: Path,
 ) -> dict:
-    """Same mechanism _run_text_block_edit already uses, extended to
-    SEVERAL blocks in one generation call instead of committing to a
-    single best guess. Real gap this closes: a rename spanning a markup
-    block and its own inline <script> (an id used both in a tag
-    attribute and the JS that references it) needs BOTH touched to stay
-    correct -- locate_text_block's single-best design saw this as a tie
-    and refused outright, even though analyzer.text_blocks.locate_text_
-    blocks found exactly which two blocks were relevant.
+    """Same mechanism as _run_text_block_edit, extended to SEVERAL blocks
+    in one generation call instead of a single best guess -- e.g. a
+    rename spanning a markup block and its inline <script> needs both
+    touched together.
 
     `blocks` is the list analyzer.text_blocks.locate_text_blocks already
-    resolved -- the caller is expected to have already checked it has
-    at least 2 entries (a single match belongs to _run_text_block_edit
-    instead, which costs one less thing for the model to have to repeat
-    verbatim)."""
+    resolved and confirmed has >= 2 entries (a single match goes to
+    _run_text_block_edit instead)."""
     run_id = f"run-{uuid.uuid4().hex[:8]}"
     on_step("GENERATE", f"regenerating {len(blocks)} blocks ({', '.join(b.name for b in blocks)})...")
 
@@ -951,46 +850,27 @@ def _run_rename_identifier(
     classification_gen: Optional[dict] = None,
     use_joern: bool = False,
 ) -> dict:
-    """Mechanical, zero-LLM-cost rename of every whole-word occurrence
-    of each (old_name, new_name) pair in `renames`. Reached when the
-    model recognizes a request means renaming one or more identifiers
-    everywhere they're used, but they aren't cleanly addressable by
-    REPLACE (a module-level variable, or a name whose occurrences reach
-    outside any single function/class's own body). Real case: "replace
-    col by column" against sessions_col AND messages_col together --
-    both are bare top-level assignments (REPLACE has no target for that
-    at all) and both are also used inside ensure_indexes()'s body, so
-    the model had escalated all the way to a full-file LLM regeneration
-    for a change with a known-correct, deterministic answer: find every
-    whole-word occurrence of each real name, substitute. A list, not a
-    single pair, because one request routinely means several related
-    renames together (sessions_col AND messages_col, not just one) --
-    reviewed and applied as one atomic change, not a round-trip per name.
+    """Mechanical, zero-LLM-cost rename of every whole-word occurrence of
+    each (old_name, new_name) pair in `renames`. Reached when a rename
+    isn't cleanly addressable by REPLACE (module-level variable, or
+    occurrences reaching outside a single function/class body) -- a
+    deterministic substitution instead of escalating to full-file LLM
+    regeneration. A list, not a single pair, since one request often
+    means several related renames applied as one atomic change.
 
-    Word-boundary matched (\\bold_name\\b) per pair, same identifier-
-    tokenizing convention this project already uses elsewhere -- never
-    a plain substring replace, which would also corrupt an unrelated
-    name that merely contains old_name (renaming "col" as a substring
-    would mangle "column" itself, or "collection").
+    Word-boundary matched (\\bold_name\\b), never a plain substring
+    replace (which would mangle e.g. "column" while renaming "col").
 
-    No repair loop: same reasoning the other FULL_REGENERATION-style
-    paths already apply -- if the mechanical rename doesn't produce
-    valid, passing code (e.g. a new_name collides with something real),
-    that's a genuine conflict the request itself needs to resolve, not
-    something a corrective prompt could fix.
+    No repair loop: if the mechanical rename doesn't produce valid,
+    passing code, that's a genuine conflict the request needs to
+    resolve, not something a corrective prompt could fix.
 
-    `use_joern=True` (opt-in) adds one real safety net this rename can't
-    give itself: rename_with_subword_fallback only ever rewrites
-    occurrences inside `file` -- a caller of the renamed symbol in a
-    DIFFERENT file is invisible to it and silently breaks. Joern's real
-    CPG (retrieval/joern_graph.py) resolves cross-file callers by actual
-    identity, not name-matching, closing the one blind spot the native
-    per-file rename has; a real cost (~12-45s+, JVM startup) as with
-    every other Joern use in this project, so this only ever runs when
-    explicitly asked for. Never blocks the rename -- surfaced as
-    `metadata["cross_file_impact_warning"]` for a human/caller to act on,
-    since Joern itself isn't infallible (dynamic dispatch, etc.) and a
-    false negative here would be worse than a false positive."""
+    `use_joern=True` (opt-in) adds a cross-file caller check via Joern's
+    CPG (retrieval/joern_graph.py): rename_with_subword_fallback only
+    rewrites occurrences inside `file`, so a caller in a different file
+    is otherwise invisible and silently breaks. Real cost (~12-45s+ JVM
+    startup), so opt-in only; never blocks the rename, just surfaces
+    `metadata["cross_file_impact_warning"]`."""
     run_id = f"run-{uuid.uuid4().hex[:8]}"
     names_desc = ", ".join(f"'{r['old_name']}' -> '{r['new_name']}'" for r in renames)
     on_step("GENERATE", f"renaming {names_desc} -- mechanical, no LLM call")
@@ -1186,28 +1066,14 @@ def _run_whole_file_delete(
     classification_gen: Optional[dict] = None,
 ) -> dict:
     """Deletes the file itself, not a symbol inside it. Reached two ways:
-
-    Zero LLM cost, the common case: matched structurally against the
-    file's own real name (is_whole_file_delete_target), never guessed
-    from a keyword list, only after find_delete_candidates/
-    find_multi_delete_targets already found no real symbol inside the
-    file matching the request (a real symbol name always wins). There's
-    nothing for a model to generate here -- the whole change is "this
-    file no longer exists."
-
-    Via the model's own escalate:{"kind":"delete_file"} otherwise (a
-    phrasing the fast path's narrow verb-first gate didn't match, e.g.
-    "please delete this file") -- classification_gen carries that
-    already-spent call's usage so it's folded into the total rather than
-    silently dropped, same pattern _run_whole_file_edit/_run_create_files
-    already use for their own escalate arrivals.
+    zero-LLM-cost, matched structurally against the file's own name
+    (is_whole_file_delete_target), only after no real symbol inside the
+    file matched the request; or via the model's own
+    escalate:{"kind":"delete_file"}, whose already-spent classification
+    cost is folded in via classification_gen.
 
     Either way, still runs the real test suite against a copy with the
-    file actually removed, exactly the same real-conflict check
-    code-level DELETE already gets (see run_edit's delete_only/
-    TEST_FAILURE handling) -- other code importing this file is exactly
-    the kind of thing this project always verifies rather than assumes
-    away."""
+    file removed, to catch other code that still depends on it."""
     run_id = f"run-{uuid.uuid4().hex[:8]}"
     on_step("GENERATE", f"unambiguous whole-file delete of '{file}' -- skipping LLM call")
 
@@ -1310,21 +1176,15 @@ def _run_language_conversion(
     classification_gen: Optional[dict] = None,
 ) -> dict:
     """"Rewrite this in Python"/"convert to JavaScript" isn't an edit to
-    the existing file at all -- the result can't still be named SHA.go
-    and parse as Go (check_syntax would refuse it), so there's no
-    REPLACE/INSERT/DELETE that expresses it. It's a new sibling file in
-    the target language, informed by the existing one -- closer to
-    CREATE than EDIT, so this mirrors create_pipeline.run_create's shape
-    (optional test_target, syntax check, then the confirmation gate)
-    rather than run_edit's (no repair loop: a wrong translation needs a
-    different prompt, not a small corrective patch).
+    the existing file -- the result can't still parse as the original
+    language, so no REPLACE/INSERT/DELETE expresses it. Produces a new
+    sibling file in the target language instead, closer to CREATE than
+    EDIT (mirrors create_pipeline.run_create's shape, no repair loop: a
+    wrong translation needs a different prompt, not a corrective patch).
 
-    target_language/target_extension both come from the model's own
-    escalate response (generate_delta, structured_edit.py's prompt), not
-    a hardcoded language/extension catalog -- it already knows the
-    conventional extension for whatever language it names, for literally
-    any language it knows about, not just ones someone thought to list
-    here in advance."""
+    target_language/target_extension come from the model's own escalate
+    response, not a hardcoded language catalog, so any language the model
+    knows works, not just ones listed here in advance."""
     new_file = target_file_for_conversion(file, target_extension)
     new_target_file = project_dir / new_file
     if new_target_file.exists():
@@ -1438,18 +1298,11 @@ def _run_question(
     classification_gen: Optional[dict] = None,
 ) -> dict:
     """"List all algorithms in this file"/"what does handle() do" aren't
-    edit instructions at all -- forcing them through REPLACE/INSERT/DELETE
-    (the only real failure mode before this existed) meant the model had
-    to fabricate *some* edit to satisfy the schema, since nothing else was
-    on offer; real case: "list all algo" got turned into a REPLACE on an
-    unrelated, ambiguously-duplicated function named "handle", failing for
-    a reason that had nothing to do with what was actually asked.
-
-    No Delta IR, no apply/test/versioning/commit -- there's nothing to
-    write, so nothing to confirm either; this always returns a terminal
-    result.status == "answered" directly. Scope is this one file only
-    (not a repo-wide retrieval): cheaper, and correct for the common case
-    of asking about the file already open."""
+    edit instructions -- forcing them through REPLACE/INSERT/DELETE made
+    the model fabricate some edit to satisfy the schema instead of
+    answering. No Delta IR, no apply/test/versioning/commit -- always
+    returns result.status == "answered" directly, scoped to this one
+    file only (not repo-wide retrieval)."""
     run_id = f"run-{uuid.uuid4().hex[:8]}"
     on_step("ANSWER", "answering from the file's real content...")
     gen = generate_answer(file_path=file, source=original_source, question=request)
@@ -1499,39 +1352,21 @@ def _run_create_files(
     vm: VersionManager,
     classification_gen: Optional[dict] = None,
 ) -> dict:
-    """"Make a new code file of frontend and backend" while editing
-    chatbot.py isn't an edit to chatbot.py at all -- real failure this
-    replaces: that exact request got forced through the whole_file
-    escalate instead, silently regenerating chatbot.py's own content
-    (bumped its version, touched nothing new) since that was the only
-    "this isn't a symbol-level edit" escape hatch available. Closer to
-    CREATE than EDIT, extended to N files in one request instead of one
-    (CREATE mode's own file-at-a-time flow needs a manual mode switch
-    per file, which "make ... frontend and backend" -- two files, one
-    request -- doesn't fit).
+    """"Make a new frontend and backend file" while editing chatbot.py
+    isn't an edit to chatbot.py -- closer to CREATE, extended to N files
+    in one request instead of CREATE mode's one-file-at-a-time flow.
 
-    also_link_current_file covers the "make a .env file that links to
-    this chatbot" shape: create the new file(s) FIRST (so their real
-    content -- e.g. .env's actual key names -- exists to react to), THEN
-    regenerate the currently open file (generate_full_file_edit, the same
-    proven whole-file mechanism _run_whole_file_edit already uses) with
-    an instruction that includes what was just created. Both the new
-    file(s) and the modified current file are one atomic accept/reject --
-    a human reviewing "created .env" would also want to see the matching
-    chatbot.py change in the same review, not as a surprise separate step.
+    also_link_current_file covers "make a .env that links to this
+    chatbot": creates the new file(s) FIRST, then regenerates the
+    currently open file with an instruction referencing what was just
+    created (generate_full_file_edit). Both are one atomic accept/reject.
 
-    No repair loop: same reasoning as the other FULL_REGENERATION paths
-    -- a wrong file needs a different prompt, not a small corrective patch.
+    No repair loop: a wrong file needs a different prompt, not a
+    corrective patch.
 
-    A path ending in "/" is a bare folder, not a file -- real failure
-    this fixes: "make a folder called frontend" had no way to express
-    "just a directory, no content" in this schema, so the model invented
-    a file named "frontend" (no extension) containing a *Python script
-    that creates a folder when run* -- syntactically valid, technically
-    "a file was created," and completely wrong. Folder paths get no LLM
-    call at all (there's nothing to generate) and are just mkdir'd,
-    matching this project's zero-cost-when-there's-nothing-to-decide
-    pattern elsewhere (deletes, confirmed picks)."""
+    A path ending in "/" is a bare folder, not a file -- gets no LLM call,
+    just mkdir'd, since there's nothing to generate for an empty
+    directory."""
     folder_paths = [p for p in new_paths if p.endswith("/")]
     file_paths = [p for p in new_paths if not p.endswith("/")]
 
@@ -1737,68 +1572,51 @@ def run_edit(
     confirm_symbol: Optional[str] = None,
     confirm_symbol_type: Optional[str] = None,
     confirm_symbol_line: Optional[int] = None,
+    confirm_symbols: Optional[List[dict]] = None,
     require_confirmation: bool = False,
     use_hybrid_retrieval: bool = False,
     use_joern: bool = False,
     on_step: Callable[[str, str], None] = lambda tag, msg: None,
     on_preview: Callable[[dict], None] = lambda data: None,
 ) -> dict:
-    """Runs the full edit pipeline and always returns a metadata dict
-    (never raises for a validation/generation failure -- check
-    metadata["result"]["status"]). Only raises for programmer errors
+    """Runs the full edit pipeline, always returns a metadata dict (never
+    raises for validation/generation failure -- check
+    metadata["result"]["status"]); only raises for programmer errors
     (missing file, bad args).
 
     `on_preview` fires once, right after APPLY, with {"operations": [...],
     "diff": "...", "file": "...", "new_file_content": "..."} -- before
-    TEST/COMMIT even run -- so a caller (the web UI) can show the actual
-    code change as soon as it exists instead of waiting for the whole run
-    to finish.
+    TEST/COMMIT -- so a caller can show the code change as soon as it
+    exists.
 
-    A "remove/delete X" request whose target word matches more than one
-    real symbol -- including the same name defined more than once, each
-    occurrence its own separate candidate now -- returns early with
-    result.status == "needs_selection" and a `candidates` list instead of
-    guessing -- a deletion is destructive and permanent, so ambiguity here
-    is worth asking about rather than picking. The caller re-runs with
-    `confirm_symbol` (+ `confirm_symbol_type`, + `confirm_symbol_line`
-    when the picked candidate's start_line disambiguates a duplicate
-    name) set to the one the user picked, which skips localization and
-    the LLM call entirely and constructs the DELETE directly -- the shape
-    of that delta is already fully determined once the target is
-    confirmed, so there's nothing left for a model to decide.
-    confirm_symbol_line is what makes a *duplicate*-name confirmation
-    actually resolve (find_symbol's prefer_line) instead of failing with
-    the same "defined N times" error a bare name confirmation can't get
-    past no matter how many times it's retried.
+    A delete request matching more than one real symbol returns early
+    with result.status == "needs_selection" and a `candidates` list
+    instead of guessing. The caller re-runs with either `confirm_symbol`
+    (+ `confirm_symbol_type`, + `confirm_symbol_line` to disambiguate a
+    duplicate name via find_symbol's prefer_line) to confirm exactly one
+    candidate, or `confirm_symbols` (a list of {"name", "symbol_type",
+    "start_line"} dicts) to confirm several at once -- both skip
+    localization and the LLM call and construct the DELETE(s) directly.
 
-    `require_confirmation=True` (the web UI's human-in-the-loop mode, the
-    CLI never sets this) pauses right after tests pass but before COMMIT:
-    returns early with result.status == "awaiting_confirmation" and
-    stashes everything needed to finish the commit in
-    `pending_confirmations`. Nothing is written to disk until the caller
-    resolves it via `pending_confirmations.resolve` (accept = commit,
-    reject = discard -- there's nothing to undo since the file was never
-    touched).
+    `require_confirmation=True` (web UI's human-in-the-loop mode; CLI
+    never sets this) pauses after tests pass but before COMMIT, returning
+    result.status == "awaiting_confirmation" and stashing everything
+    needed to finish in `pending_confirmations`. Nothing is written to
+    disk until `pending_confirmations.resolve` (accept = commit, reject =
+    discard).
 
-    `use_hybrid_retrieval=True` fuses the normal name/docstring symbol
-    match with BM25 keyword and vector/semantic retrieval over the
-    file's own symbols (context_builder.build_context's use_hybrid) --
-    the same reasoning `iee find`'s repo-wide hybrid retrieval already
-    applies, scoped to one file. Off by default: vector retrieval is a
-    real embeddings-API call on every request that reaches normal
-    localization, not free like the rest of this pipeline's fast paths,
-    and every offline test in this project's own suite relies on this
-    defaulting off to stay deterministic and network-free. The CLI and
-    web UI both opt in explicitly.
+    `use_hybrid_retrieval=True` fuses name/docstring symbol match with
+    BM25 + vector/semantic retrieval (context_builder.build_context's
+    use_hybrid). Off by default: it's a real embeddings-API call, and
+    this project's offline test suite relies on it defaulting off to stay
+    deterministic and network-free.
 
-    `use_joern=True` (opt-in) adds a real cross-file caller check (via
-    Joern's CPG, retrieval/joern_graph.py) before a mechanical rename
-    only -- the one case this pipeline can silently miss a caller in
-    another file for (rename_with_subword_fallback only ever touches
-    the file it's given). Never blocks the rename; surfaced as
-    metadata["cross_file_impact_warning"] for a human to act on. Off by
-    default: a real ~12-45s+ JVM cost, not something to pay on every
-    rename unasked."""
+    `use_joern=True` (opt-in) adds a cross-file caller check via Joern's
+    CPG before a mechanical rename -- rename_with_subword_fallback only
+    touches the file it's given, so a caller elsewhere would otherwise
+    silently break. Never blocks the rename; surfaced as
+    metadata["cross_file_impact_warning"]. Off by default: real
+    ~12-45s+ JVM cost."""
 
     project_dir = Path(project_dir).resolve()
     target_file = project_dir / file
@@ -1843,7 +1661,7 @@ def run_edit(
     if language is None and looks_like_python(original_source):
         language = "python"
 
-    if not confirm_symbol:
+    if not confirm_symbol and not confirm_symbols:
         rename_target = find_rename_target(original_source, request, language)
         if rename_target:
             old_name, new_name = rename_target
@@ -1868,7 +1686,7 @@ def run_edit(
             )
 
     multi_delete_targets = None
-    if not confirm_symbol and is_delete_intent(request):
+    if not confirm_symbol and not confirm_symbols and is_delete_intent(request):
         multi_delete_targets = find_multi_delete_targets(original_source, request, language)
         if multi_delete_targets is None:
             delete_candidates = find_delete_candidates(original_source, request, language)
@@ -1909,7 +1727,12 @@ def run_edit(
                 confirm_symbol_type = only.symbol_type
                 confirm_symbol_line = only.start_line
 
-    if not confirm_symbol and not multi_delete_targets and (language is None or not language_has_symbol_concept(language)):
+    if (
+        not confirm_symbol
+        and not confirm_symbols
+        and not multi_delete_targets
+        and (language is None or not language_has_symbol_concept(language))
+    ):
         if use_hybrid_retrieval:
             on_step("RETRIEVE", "block name-match + BM25 + vector retrieval, then fusing rankings...")
         matched_blocks = locate_text_blocks(original_source, request, language)
@@ -1973,7 +1796,7 @@ def run_edit(
             language=language,
         )
 
-    if not confirm_symbol and not multi_delete_targets:
+    if not confirm_symbol and not confirm_symbols and not multi_delete_targets:
         jev_kind = classify_request_kind(request)
         if jev_kind in DISPATCHABLE_KINDS:
             on_step("LOCALIZE", f"Jev classified this as '{jev_kind}' -- skipping structured-edit classification")
@@ -2003,7 +1826,7 @@ def run_edit(
                 language=language,
             )
 
-    if confirm_symbol or multi_delete_targets:
+    if confirm_symbol or multi_delete_targets or confirm_symbols:
         if multi_delete_targets:
             names = ", ".join(s.name for s in multi_delete_targets)
             on_step("LOCALIZE", f"{len(multi_delete_targets)} targets unambiguous -- skipping localization")
@@ -2014,6 +1837,23 @@ def run_edit(
             ]
             candidate_symbols = [s.name for s in multi_delete_targets]
             candidate_lines = {s.name: s.start_line for s in multi_delete_targets}
+        elif confirm_symbols:
+            names = ", ".join(s["name"] for s in confirm_symbols)
+            on_step("LOCALIZE", f"{len(confirm_symbols)} targets confirmed -- skipping localization")
+            on_step("GENERATE", f"unambiguous delete of {names} -- skipping LLM call")
+            operations = [
+                {
+                    "operation": "DELETE",
+                    "target": {
+                        "file": file,
+                        "symbol_type": s.get("symbol_type") or "function",
+                        "symbol_name": s["name"],
+                    },
+                }
+                for s in confirm_symbols
+            ]
+            candidate_symbols = [s["name"] for s in confirm_symbols]
+            candidate_lines = {s["name"]: s["start_line"] for s in confirm_symbols if s.get("start_line") is not None}
         else:
             on_step("LOCALIZE", "target unambiguous -- skipping localization")
             on_step("GENERATE", f"unambiguous delete of '{confirm_symbol}' -- skipping LLM call")

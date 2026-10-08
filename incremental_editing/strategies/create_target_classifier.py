@@ -1,26 +1,15 @@
-"""Decides whether a request with no existing edit target actually wants
-brand-new file(s)/folder(s) created, and if so, what real path(s) they
-should have -- the one real gap between "auto-locate found nothing" and
-refusing the request outright. Handles a multi-file/folder request (e.g.
-"frontend and backend in separate folders") the same way run_pipeline.
-_run_create_files already does for an escalated edit-mode request --
-one path per real responsibility, never merged into a single file.
+"""Decides whether a request with no existing edit target wants new
+file(s)/folder(s) created, and proposes real path(s) -- one per real
+responsibility, same rule run_pipeline._run_create_files uses for an
+escalated edit-mode request.
 
-Real gap this closes: edit mode with no file selected, and hybrid
-retrieval finding no existing candidate (a genuinely new/near-empty
-project, or a request that just doesn't match anything that exists),
-previously refused outright ("no file given and hybrid retrieval found
-no candidate") even for a request that plainly describes creating a new
-file -- forcing a manual switch to Create mode (and typing the exact
-filename by hand) for something the request itself already said.
+Previously, edit mode with no file selected and no retrieval candidate
+was refused outright, even for requests that plainly describe creating
+something new, forcing a manual switch to Create mode.
 
-Deliberately a real, structured-output model call -- never a keyword/
-regex guess at intent ("contains 'make a new file'..."). Same "escalate
-is model-driven, mechanical code never guesses" contract every other
-classification in this project already holds itself to. A single,
-cheap call: no context beyond the request and a bare file listing, no
-generation, nothing this project's own offline test suite can't mock
-exactly like generate_delta's own classification call already is."""
+A real structured-output model call, never a keyword/regex guess --
+same "escalate is model-driven" contract every other classification in
+this project holds to."""
 
 import json
 import time

@@ -1,14 +1,8 @@
-"""Q&A strategy: answer a question *about* a file instead of editing it.
+"""Q&A strategy: answer a question about a file instead of editing it.
 
-Reached only via generate_delta's escalate:{"kind":"question"} signal (see
-structured_edit.py's prompt) -- the model itself recognizes, from the
-request's own shape alone (no file content needed to tell "list all
-algorithms" or "what does handle() do" apart from an edit instruction),
-that there's nothing to change here. Given the whole file (scope choice:
-this file only, not a repo-wide retrieval -- cheaper, and correct for
-"explain/list/describe this file" which is the common case), answer the
-actual question directly. No Delta IR, no apply/test/versioning/commit,
-nothing written -- there's nothing to confirm either.
+Reached via generate_delta's escalate:{"kind":"question"} signal. Given the
+whole file (not repo-wide retrieval), answers directly -- no Delta IR, no
+apply/test/versioning/commit.
 """
 
 import time

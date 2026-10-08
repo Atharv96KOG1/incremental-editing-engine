@@ -93,14 +93,31 @@ export default function App() {
   // before the fetch resolves.
   const historyLoadedForRef = useRef(null)
 
+  // Set the instant a send actually goes out for a given project dir
+  // (handleSend/handleConfirmCandidates/handleConfirmRun, all before the
+  // 500ms project-dir debounce below has necessarily settled). A fast,
+  // LLM-skip response (confirmed delete, rename, needs_selection) can
+  // land well inside that 500ms window -- without this guard, the
+  // debounce settling afterward would still see "project changed" and
+  // wipe the just-started conversation via setMessages([]) to make room
+  // for a (likely empty) history fetch that's now stale anyway.
+  const conversationStartedRef = useRef(null)
+
   useEffect(() => {
     const projectChanged = prevProjectDirRef.current !== debouncedProjectDir
     prevProjectDirRef.current = debouncedProjectDir
 
     if (projectChanged) {
       setChangedPaths(new Set())
-      setMessages([])
-      historyLoadedForRef.current = null
+      // A send already went out for this exact directory before the
+      // debounce settled (conversationStartedRef) -- that live state is
+      // more current than anything a history fetch would return, so skip
+      // the reset/reload and just mark history as settled.
+      const liveConversationActive = conversationStartedRef.current === debouncedProjectDir
+      if (!liveConversationActive) {
+        setMessages([])
+        historyLoadedForRef.current = null
+      }
       // No project directory chosen yet (the app's own starting state,
       // not a leftover default) -- nothing to fetch, and fetchTree('')
       // against the server's own cwd would be a real, misleading call.
@@ -111,17 +128,21 @@ export default function App() {
         return
       }
       loadTree(debouncedProjectDir)
-      fetchChatHistory(debouncedProjectDir)
-        .then(({ messages: loaded }) => {
-          if (loaded?.length) {
-            setMessages(loaded)
-            nextId = Math.max(0, ...loaded.map((m) => m.id || 0)) + 1
-          }
-        })
-        .catch(() => {})
-        .finally(() => {
-          historyLoadedForRef.current = debouncedProjectDir
-        })
+      if (liveConversationActive) {
+        historyLoadedForRef.current = debouncedProjectDir
+      } else {
+        fetchChatHistory(debouncedProjectDir)
+          .then(({ messages: loaded }) => {
+            if (loaded?.length) {
+              setMessages(loaded)
+              nextId = Math.max(0, ...loaded.map((m) => m.id || 0)) + 1
+            }
+          })
+          .catch(() => {})
+          .finally(() => {
+            historyLoadedForRef.current = debouncedProjectDir
+          })
+      }
       if (config.mode !== 'find' && debouncedFile) {
         const path = debouncedFile
         setTabs([{ path, content: '', diff: null, revision: 0, isLive: false, pendingRunId: null }])
@@ -482,6 +503,8 @@ export default function App() {
       return
     }
 
+    conversationStartedRef.current = config.projectDir
+
     // Unlike edit mode (which auto-locates a blank File field via hybrid
     // retrieval), create mode has no such fallback -- a blank field sends
     // file: null, which the backend can now only refuse cleanly instead
@@ -592,14 +615,19 @@ export default function App() {
     }
   }
 
-  // Fires when the user picks one candidate off a needs_selection picker
-  // (a destructive "remove/delete X" request that matched more than one
-  // real symbol). Resubmits the same request with that exact symbol
-  // confirmed -- skips localization and the LLM call entirely, since the
-  // DELETE's shape is fully determined once the target is known.
-  const handleSelectCandidate = async (assistantId, candidate, priorMetadata) => {
+  // Fires when the user confirms one or more candidates off a
+  // needs_selection picker (a destructive "remove/delete X" request that
+  // matched more than one real symbol). Resubmits the same request with
+  // every selected symbol confirmed -- skips localization and the LLM
+  // call entirely, since each DELETE's shape is fully determined once its
+  // target is known.
+  const handleConfirmCandidates = async (assistantId, candidates, priorMetadata) => {
     patchMessage(assistantId, { selectionPending: true })
-    appendStep(assistantId, 'CONFIRM', `confirmed target: ${candidate.name} (${candidate.symbol_type})`)
+    appendStep(
+      assistantId,
+      'CONFIRM',
+      `confirmed ${candidates.length} target(s): ${candidates.map((c) => c.name).join(', ')}`,
+    )
     setSending(true)
 
     const payload = {
@@ -608,9 +636,11 @@ export default function App() {
       file: priorMetadata.file,
       request: priorMetadata.user_request,
       test_target: config.testTarget,
-      confirm_symbol: candidate.name,
-      confirm_symbol_type: candidate.symbol_type,
-      confirm_symbol_line: candidate.start_line,
+      confirm_symbols: candidates.map((c) => ({
+        name: c.name,
+        symbol_type: c.symbol_type,
+        start_line: c.start_line,
+      })),
       require_confirmation: true,
     }
 
@@ -708,7 +738,7 @@ export default function App() {
             </div>
           ) : (
             messages.map((m) => (
-              <Message key={m.id} message={m} onSelectCandidate={handleSelectCandidate} onConfirmRun={handleConfirmRun} />
+              <Message key={m.id} message={m} onConfirmCandidates={handleConfirmCandidates} onConfirmRun={handleConfirmRun} />
             ))
           )}
           <div ref={logEndRef} />

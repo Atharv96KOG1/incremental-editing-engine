@@ -1,17 +1,8 @@
-"""Repository-wide symbol index (PHOENIX doc section 1: "Repository
-Ingestion -> Global Code Knowledge Base -> Symbol Index").
-
-The existing `analyzer/locator.py` only ever looks at one file, because
-every existing entry point (`iee edit --file ...`) already names the file.
-This module is what makes the file itself discoverable: walk every source
-file in a project, index every symbol in every one, so retrieval can
-answer "which file/symbol" instead of just "which symbol in this file".
-
-Python files use the `ast`-based path (unchanged, proven). Every other
-file goes through `multilang_symbols.py` (Tree-sitter): unrecognized
-extensions are skipped rather than guessed at, same as
-`validation/syntax.py` already does for syntax-checking.
-"""
+"""Repository-wide symbol index: walks every source file in a project and
+indexes every symbol, so retrieval can answer "which file/symbol" instead
+of just "which symbol in this file". Python uses `ast`; other languages go
+through `multilang_symbols.py` (Tree-sitter), skipping unrecognized
+extensions rather than guessing."""
 
 import ast
 import os
@@ -30,16 +21,11 @@ _IEEIGNORE_FILENAME = ".ieeignore"
 
 
 def project_ignore_dirs(project_dir: str) -> set:
-    """Extra directory names to skip for THIS project only, declared in
-    a `.ieeignore` file at its own root (one bare directory name per
-    line, '#' comments and blank lines skipped) -- the same idea as
-    .gitignore, for when a project directory legitimately contains real
-    content that repo-wide retrieval (and validation's own copy, see
-    validation/tests.py) shouldn't touch: an unrelated demo/scratch
-    folder living alongside the real project, for instance. Deliberately
-    never a name hardcoded into this shared module -- that would wrongly
-    exclude some *other* project's real, identically-named folder.
-    Entirely opt-in, declared by whoever owns that project directory."""
+    """Extra directories to skip for this project, from a `.ieeignore`
+    file at its own root (one name per line, '#' comments skipped) --
+    like .gitignore. Opt-in per project rather than hardcoded here, since
+    a hardcoded name could wrongly exclude another project's real,
+    identically-named folder."""
     path = os.path.join(project_dir, _IEEIGNORE_FILENAME)
     if not os.path.isfile(path):
         return set()
@@ -95,12 +81,10 @@ _index_cache: dict = {}
 
 
 def _fingerprint(project_dir: str) -> tuple:
-    """Cheap (stat-only, no read/parse) signature of every source file
-    under project_dir -- lets build_repo_index skip re-reading and
-    re-parsing the entire repo on every call when nothing has changed
-    since the last one. A stale in-memory index (edits made outside this
-    process while it's running) would be worse than the cost this avoids,
-    so it's a real stat() per file, not a directory mtime shortcut."""
+    """Cheap stat-only signature of every source file under project_dir,
+    letting build_repo_index skip re-parsing when nothing changed. Uses a
+    real stat() per file, not a directory mtime shortcut, since a stale
+    index would be worse than the cost this avoids."""
     entries = []
     for path in iter_source_files(project_dir):
         try:
@@ -113,14 +97,9 @@ def _fingerprint(project_dir: str) -> tuple:
 
 def build_repo_index(project_dir: str, use_cache: bool = True) -> List[RepoSymbol]:
     """Indexes every function/class in every recognized source file under
-    project_dir. A file that fails to parse (syntax error, non-UTF8, or an
-    unrecognized/unsupported language) is skipped rather than aborting the
-    whole index.
-
-    Cached per project_dir, invalidated automatically the moment any
-    file's mtime/size changes -- repeat calls in a long-running process
-    (`iee serve`) reuse the previous index instead of re-walking and
-    re-parsing every file from scratch each time."""
+    project_dir. A file that fails to parse is skipped rather than
+    aborting the whole index. Cached per project_dir, invalidated when any
+    file's mtime/size changes."""
     if use_cache:
         fingerprint = _fingerprint(project_dir)
         cached = _index_cache.get(project_dir)

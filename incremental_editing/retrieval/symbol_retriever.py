@@ -1,7 +1,5 @@
-"""Literal-name / keyword-overlap retrieval over the repo-wide index --
-the same scoring `analyzer/locator.py` already uses for a single file,
-applied across every file in the repo (PHOENIX doc section 4: "Symbol
-retrieval is strong for definitions and references").
+"""Literal-name / keyword-overlap retrieval over the repo-wide index -- the
+same scoring `analyzer/locator.py` uses for a single file, applied repo-wide.
 """
 
 import re
