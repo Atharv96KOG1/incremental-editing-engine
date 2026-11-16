@@ -8,6 +8,8 @@ import sys
 from ..retrieval.repo_index import project_ignore_dirs
 
 NO_TESTS_COLLECTED = 5
+USAGE_ERROR = 4
+_NO_SUCH_PATH_RE = re.compile(r"file or directory not found")
 
 _VALIDATION_COPY_IGNORE_NAMES = (
     ".git", "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache",
@@ -55,7 +57,9 @@ def run_tests(test_target: str, cwd: str, timeout: float = 120) -> dict:
         m = re.search(pattern, output)
         return int(m.group(1)) if m else 0
 
-    no_tests_collected = proc.returncode == NO_TESTS_COLLECTED
+    no_tests_collected = proc.returncode == NO_TESTS_COLLECTED or (
+        proc.returncode == USAGE_ERROR and _NO_SUCH_PATH_RE.search(output) is not None
+    )
     return {
         "return_code": proc.returncode,
         "passed": _count(r"(\d+) passed"),
