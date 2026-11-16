@@ -306,6 +306,15 @@ async def run(req: RunRequest) -> StreamingResponse:
     return StreamingResponse(event_stream(), media_type="text/event-stream")
 
 
+@app.get("/api/info")
+def api_info() -> dict:
+    """Lightweight metadata for embedders (e.g. the VS Code sidebar's model
+    chip). Never includes secrets."""
+    from .config import get_settings
+
+    return {"model": get_settings().llm_model}
+
+
 @app.post("/api/confirm")
 def confirm(req: ConfirmRequest) -> dict:
     """Resolves a run paused by require_confirmation: accept commits (file +

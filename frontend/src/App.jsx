@@ -12,10 +12,16 @@ let nextId = 1
 let nextRevision = 1
 const TAB_LIVE_DOT_MS = 2600
 
+function initialProjectDir() {
+  // Lets an embedder (e.g. the VS Code extension) preset the project
+  // directory via ?projectDir=... instead of requiring manual entry.
+  return new URLSearchParams(window.location.search).get('projectDir') || ''
+}
+
 export default function App() {
   const [config, setConfig] = useState({
     mode: 'edit',
-    projectDir: '',
+    projectDir: initialProjectDir(),
     file: '',
     testTarget: '.',
     useJoern: 'off',

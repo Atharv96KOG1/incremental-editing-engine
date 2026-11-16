@@ -1,0 +1,189 @@
+{
+  "name": "incremental-editing-engine",
+  "displayName": "Incremental Editing Engine",
+  "description": "Chat-driven, cost-efficient incremental code editing — right inside VS Code.",
+  "icon": "media/logo.png",
+  "galleryBanner": {
+    "color": "#0b2f2a",
+    "theme": "dark"
+  },
+  "version": "0.1.0",
+  "publisher": "CodeQuest",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Atharv96KOG1/incremental-editing-engine.git",
+    "directory": "vscode-extension"
+  },
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Other",
+    "Machine Learning"
+  ],
+  "keywords": [
+    "ai",
+    "code editing",
+    "llm",
+    "refactoring"
+  ],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "incrementalEditingEngine",
+          "title": "Incremental Editing",
+          "icon": "media/icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "incrementalEditingEngine": [
+        {
+          "type": "webview",
+          "id": "incrementalEditingEngine.chat",
+          "name": "Incremental Editing"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "incrementalEditingEngine.focus",
+        "title": "Incremental Editing Engine: Open Chat",
+        "icon": "$(zap)"
+      },
+      {
+        "command": "incrementalEditingEngine.newChat",
+        "title": "Incremental Editing Engine: New Conversation"
+      },
+      {
+        "command": "incrementalEditingEngine.history",
+        "title": "Incremental Editing Engine: Past Conversations"
+      },
+      {
+        "command": "incrementalEditingEngine.walkthrough",
+        "title": "Incremental Editing Engine: See How It Works"
+      },
+      {
+        "command": "incrementalEditingEngine.openPanel",
+        "title": "Incremental Editing Engine: Open Full Web UI"
+      },
+      {
+        "command": "incrementalEditingEngine.start",
+        "title": "Incremental Editing Engine: Start Server"
+      },
+      {
+        "command": "incrementalEditingEngine.stop",
+        "title": "Incremental Editing Engine: Stop Server"
+      },
+      {
+        "command": "incrementalEditingEngine.restart",
+        "title": "Incremental Editing Engine: Restart Server"
+      }
+    ],
+    "menus": {
+      "editor/title": [
+        {
+          "command": "incrementalEditingEngine.focus",
+          "group": "navigation",
+          "when": "resourceLangId"
+        }
+      ]
+    },
+    "keybindings": [
+      {
+        "command": "incrementalEditingEngine.focus",
+        "key": "ctrl+escape",
+        "mac": "cmd+escape",
+        "when": "focusedView != incrementalEditingEngine.chat"
+      },
+      {
+        "command": "workbench.action.focusActiveEditorGroup",
+        "key": "ctrl+escape",
+        "mac": "cmd+escape",
+        "when": "focusedView == incrementalEditingEngine.chat"
+      }
+    ],
+    "configuration": {
+      "title": "Incremental Editing Engine",
+      "properties": {
+        "incrementalEditingEngine.command": {
+          "type": "string",
+          "default": "iee",
+          "description": "Command used to launch the backend (the console script installed by `pip install -e .`, e.g. `iee`, or a full path to it)."
+        },
+        "incrementalEditingEngine.pythonFallback": {
+          "type": "string",
+          "default": "python3",
+          "description": "Python interpreter used to launch `-m incremental_editing.cli serve` if the command above isn't found on PATH."
+        },
+        "incrementalEditingEngine.host": {
+          "type": "string",
+          "default": "127.0.0.1",
+          "description": "Host the backend binds to."
+        },
+        "incrementalEditingEngine.port": {
+          "type": "number",
+          "default": 8787,
+          "description": "Port the backend binds to."
+        },
+        "incrementalEditingEngine.projectDir": {
+          "type": "string",
+          "default": "",
+          "description": "Project directory to preset in the chat UI. Empty = use the first open workspace folder."
+        }
+      }
+    },
+    "walkthroughs": [
+      {
+        "id": "incrementalEditingEngine.gettingStarted",
+        "title": "Incremental Editing Engine",
+        "description": "Edit code one function at a time. Only the code that changes is sent to the model.",
+        "steps": [
+          {
+            "id": "demo",
+            "title": "See a full edit run",
+            "description": "Ask for a change, watch the engine find the one function involved, review the diff, then accept it.\n[Open the chat](command:incrementalEditingEngine.focus)",
+            "media": {
+              "image": "media/demo.gif",
+              "altText": "Chat panel: a request is typed, pipeline steps stream in, a diff appears and is accepted."
+            }
+          },
+          {
+            "id": "install",
+            "title": "Install the engine",
+            "description": "The extension runs the engine locally. In the engine repo run `pip install -e .`, then set `OPENAI_API_KEY` in `.env`.\n[Open settings](command:workbench.action.openSettings?%22incrementalEditingEngine%22)",
+            "media": {
+              "image": "media/screenshot.png",
+              "altText": "The chat panel, ready for a request"
+            }
+          },
+          {
+            "id": "try",
+            "title": "Try it on your code",
+            "description": "Open a file, press Cmd+Esc (Ctrl+Esc on Windows/Linux) and describe the change. Use Edit, Create or Find from the mode switch, or type / for commands.\n[Start chatting](command:incrementalEditingEngine.focus)",
+            "media": {
+              "image": "media/screenshot.png",
+              "altText": "The chat panel, ready for a request"
+            }
+          }
+        ]
+      }
+    ]
+  },
+  "scripts": {
+    "compile": "tsc -p ./ && node esbuild.js",
+    "watch": "node esbuild.js --watch",
+    "vscode:prepublish": "npm run compile",
+    "package": "npm run compile && npx @vscode/vsce package"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "@types/vscode": "^1.85.0",
+    "esbuild": "^0.21.0",
+    "typescript": "^5.4.0"
+  },
+  "activationEvents": []
+}
