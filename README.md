@@ -6,6 +6,9 @@
 
 check this from the VS code extension marketplace : https://marketplace.visualstudio.com/items?itemName=CodeQuest.incremental-editing-engine
 
+<img width="495" height="855" alt="image" src="https://github.com/user-attachments/assets/e2d6dd52-6acf-4b55-a1a6-8653d5a922d5" />
+
+
 Locates the exact function, block, or region a request touches — sends *only that* to the model — and refuses, by policy, to fall back to regenerating the whole file.
 
 [![Python](https://img.shields.io/badge/python-3.12%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
